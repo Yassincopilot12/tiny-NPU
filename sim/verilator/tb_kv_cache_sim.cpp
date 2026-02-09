@@ -35,8 +35,8 @@ static int               tc = 0;
 // Model configuration (must match ddr_map.py)
 // =============================================================================
 static const int HIDDEN     = 64;
-static const int HEAD_DIM   = 64;
-static const int HEADS      = 1;
+static const int HEAD_DIM   = 16;
+static const int HEADS      = 4;
 static const int FFN_DIM    = 256;
 static const int N_LAYERS   = 4;
 static const int VOCAB_SIZE = 256;
@@ -45,7 +45,10 @@ static const int MAX_SEQ    = 16;
 // Quantization
 static const int GEMM_SCALE = 1;
 static const int GEMM_SHIFT = 9;
-static const uint16_t GEMM_IMM = 0x0901;
+static const uint16_t GEMM_IMM     = 0x0901;
+static const uint16_t GEMM_IMM_K64 = 0x0901;  // shift=9, scale=1 for K=64
+static const uint16_t GEMM_IMM_K16 = 0x0701;  // shift=7, scale=1 for K=16
+static const uint16_t GEMM_IMM_KS  = 0x0701;  // shift=7, scale=1 for K=S
 
 // =============================================================================
 // SRAM0 Memory layout for block execution (byte addresses)
@@ -59,18 +62,24 @@ static const uint16_t ADDR_W1       = 0x4000;  // [64][256] = 16384B
 static const uint16_t ADDR_W2       = 0x8000;  // [256][64] = 16384B
 static const uint16_t ADDR_X        = 0xC000;  // [16][64]  = 1024B
 static const uint16_t ADDR_LN1_OUT  = 0xC400;  // [16][64]  = 1024B
-static const uint16_t ADDR_Q        = 0xC800;  // [16][64]  = 1024B
-static const uint16_t ADDR_K        = 0xCC00;  // [16][64]  = 1024B
-static const uint16_t ADDR_V        = 0xD000;  // [16][64]  = 1024B
-static const uint16_t ADDR_S        = 0xD400;  // [16][16]  = 256B
-static const uint16_t ADDR_P        = 0xD500;  // [16][16]  = 256B
-static const uint16_t ADDR_ATTN     = 0xD600;  // [16][64]  = 1024B
-static const uint16_t ADDR_WO_OUT   = 0xDA00;  // [16][64]  = 1024B
-static const uint16_t ADDR_X2       = 0xDE00;  // [16][64]  = 1024B
-static const uint16_t ADDR_LN2_OUT  = 0xE200;  // [16][64]  = 1024B
-static const uint16_t ADDR_FFN1     = 0xE600;  // [16][256] = 4096B
-static const uint16_t ADDR_FFN2     = 0xF600;  // [16][64]  = 1024B
-static const uint16_t ADDR_X_OUT    = 0xFA00;  // [16][64]  = 1024B
+static const uint16_t ADDR_Q_H      = 0xC800;  // [S][16] per-head Q
+static const uint16_t ADDR_K_H      = 0xC900;  // [S][16] per-head K
+static const uint16_t ADDR_V_H      = 0xCA00;  // [S][16] per-head V
+static const uint16_t ADDR_S        = 0xCB00;  // [S][S]  score
+static const uint16_t ADDR_P        = 0xCC00;  // [S][S]  softmax
+static const uint16_t ADDR_ATTN_H   = 0xCD00;  // [S][16] per-head context
+static const uint16_t ADDR_ATTN     = 0xCE00;  // [S][64] concat all heads
+static const uint16_t ADDR_WO_OUT   = 0xD200;  // [S][64]
+static const uint16_t ADDR_X2       = 0xD600;  // [S][64]
+static const uint16_t ADDR_LN2_OUT  = 0xDA00;  // [S][64]
+static const uint16_t ADDR_FFN1     = 0xDE00;  // [S][256]
+static const uint16_t ADDR_FFN2     = 0xEE00;  // [S][64]
+static const uint16_t ADDR_X_OUT    = 0xF200;  // [S][64]
+
+// Keep old names for backward compat where needed
+static const uint16_t ADDR_Q        = ADDR_Q_H;
+static const uint16_t ADDR_K        = ADDR_K_H;
+static const uint16_t ADDR_V        = ADDR_V_H;
 
 // SRAM0 addresses for lm_head phase (reuses SRAM0 from 0x0000)
 static const uint16_t ADDR_LM_INPUT  = 0x0000;  // [1][64]  = 64B
@@ -105,25 +114,29 @@ static const int LM_HEAD_SIZE  = VOCAB_SIZE * HIDDEN;        // 16384
 static const int WEIGHTS_TOTAL = LM_HEAD_OFFSET + LM_HEAD_SIZE; // 230976
 
 // =============================================================================
-// Decode-mode SRAM0 addresses (S=1, weights same region)
+// Decode-mode SRAM0 addresses (S=1, weights same region) - per-head layout
 // Must match kv_map.py ADDR_DEC_* constants
 // =============================================================================
 static const uint16_t ADDR_DEC_X        = 0xC000;  // [1][64]  = 64B
 static const uint16_t ADDR_DEC_LN1_OUT  = 0xC040;  // [1][64]  = 64B
-static const uint16_t ADDR_DEC_Q        = 0xC080;  // [1][64]  = 64B
-static const uint16_t ADDR_DEC_K_NEW    = 0xC0C0;  // [1][64]  = 64B
-static const uint16_t ADDR_DEC_V_NEW    = 0xC100;  // [1][64]  = 64B
-static const uint16_t ADDR_DEC_K_CACHE  = 0xC140;  // [16][64] = 1024B
-static const uint16_t ADDR_DEC_V_CACHE  = 0xC540;  // [16][64] = 1024B
-static const uint16_t ADDR_DEC_S        = 0xC940;  // [1][16]  = 16B
-static const uint16_t ADDR_DEC_P        = 0xC950;  // [1][16]  = 16B
-static const uint16_t ADDR_DEC_ATTN     = 0xC960;  // [1][64]  = 64B
-static const uint16_t ADDR_DEC_WO_OUT   = 0xC9A0;  // [1][64]  = 64B
-static const uint16_t ADDR_DEC_X2       = 0xC9E0;  // [1][64]  = 64B
-static const uint16_t ADDR_DEC_LN2_OUT  = 0xCA20;  // [1][64]  = 64B
-static const uint16_t ADDR_DEC_FFN1     = 0xCA60;  // [1][256] = 256B
-static const uint16_t ADDR_DEC_FFN2     = 0xCB60;  // [1][64]  = 64B
-static const uint16_t ADDR_DEC_X_OUT    = 0xCBA0;  // [1][64]  = 64B
+static const uint16_t ADDR_DEC_Q_H      = 0xC080;  // [1][16]  = 16B per-head
+static const uint16_t ADDR_DEC_K_NEW    = 0xC090;  // [1][16]  = 16B per-head
+static const uint16_t ADDR_DEC_V_NEW    = 0xC0A0;  // [1][16]  = 16B per-head
+static const uint16_t ADDR_DEC_K_CACHE  = 0xC0B0;  // [T][16]  = 256B per-head
+static const uint16_t ADDR_DEC_V_CACHE  = 0xC1B0;  // [T][16]  = 256B per-head
+static const uint16_t ADDR_DEC_S        = 0xC2B0;  // [1][T]
+static const uint16_t ADDR_DEC_P        = 0xC2C0;  // [1][T]
+static const uint16_t ADDR_DEC_ATTN_H   = 0xC2D0;  // [1][16] per-head
+static const uint16_t ADDR_DEC_ATTN     = 0xC2E0;  // [1][64] concat
+static const uint16_t ADDR_DEC_WO_OUT   = 0xC320;  // [1][64]
+static const uint16_t ADDR_DEC_X2       = 0xC360;  // [1][64]
+static const uint16_t ADDR_DEC_LN2_OUT  = 0xC3A0;  // [1][64]
+static const uint16_t ADDR_DEC_FFN1     = 0xC3E0;  // [1][256]
+static const uint16_t ADDR_DEC_FFN2     = 0xC4E0;  // [1][64]
+static const uint16_t ADDR_DEC_X_OUT    = 0xC520;  // [1][64]
+
+// Keep old name for backward compat
+static const uint16_t ADDR_DEC_Q        = ADDR_DEC_Q_H;
 
 // =============================================================================
 // Opcodes and Flags
@@ -140,6 +153,7 @@ static const uint8_t OP_BARRIER    = 10;
 static const uint8_t OP_END        = 255;
 
 static const uint8_t FLAG_TRANSPOSE_B = 0x01;
+static const uint8_t FLAG_COPY2D      = 0x04;
 static const uint8_t FLAG_REQUANT     = 0x04;
 static const uint8_t FLAG_CAUSAL_MASK = 0x10;
 
@@ -329,9 +343,10 @@ void handle_dma_command() {
 
 // =============================================================================
 // KV Cache Storage (C++ software, accessed via hardware shim)
+// Per-head KV cache: [N_LAYERS][HEADS][MAX_SEQ][HEAD_DIM]
 // =============================================================================
-static int8_t kv_cache_k[N_LAYERS][MAX_SEQ][HIDDEN];  // K cache per layer
-static int8_t kv_cache_v[N_LAYERS][MAX_SEQ][HIDDEN];  // V cache per layer
+static int8_t kv_cache_k[N_LAYERS][HEADS][MAX_SEQ][HEAD_DIM];
+static int8_t kv_cache_v[N_LAYERS][HEADS][MAX_SEQ][HEAD_DIM];
 
 void kv_cache_clear() {
     memset(kv_cache_k, 0, sizeof(kv_cache_k));
@@ -341,19 +356,21 @@ void kv_cache_clear() {
 // Handle KV_APPEND: read vector from SRAM0, store into KV cache
 void handle_kv_append() {
     uint16_t src_addr = dut->kv_src_out;
-    int layer   = dut->kv_m_out;
+    int layer    = dut->kv_m_out;
     int time_idx = dut->kv_k_out;
     int vec_len  = dut->kv_n_out;
     int is_v     = dut->kv_flags_out & 0x01;
+    int head_id  = dut->kv_imm_out;
 
     if (NPU_DUMP) {
-        std::cout << "  KV_APPEND: layer=" << layer << " t=" << time_idx
+        std::cout << "  KV_APPEND: layer=" << layer << " head=" << head_id
+                  << " t=" << time_idx
                   << " is_v=" << is_v << " src=0x" << std::hex << src_addr
                   << " len=" << std::dec << vec_len << std::endl;
     }
 
-    int8_t* dst = is_v ? kv_cache_v[layer][time_idx]
-                       : kv_cache_k[layer][time_idx];
+    int8_t* dst = is_v ? kv_cache_v[layer][head_id][time_idx]
+                       : kv_cache_k[layer][head_id][time_idx];
     for (int j = 0; j < vec_len; j++) {
         dst[j] = (int8_t)sram0_read(src_addr + j);
     }
@@ -366,16 +383,18 @@ void handle_kv_read() {
     int time_len = dut->kv_k_out;
     int vec_len  = dut->kv_n_out;
     int is_v     = dut->kv_flags_out & 0x01;
+    int head_id  = dut->kv_imm_out;
 
     if (NPU_DUMP) {
-        std::cout << "  KV_READ: layer=" << layer << " time_len=" << time_len
+        std::cout << "  KV_READ: layer=" << layer << " head=" << head_id
+                  << " time_len=" << time_len
                   << " is_v=" << is_v << " dst=0x" << std::hex << dst_addr
                   << " len=" << std::dec << vec_len << std::endl;
     }
 
     for (int t = 0; t < time_len; t++) {
-        const int8_t* src = is_v ? kv_cache_v[layer][t]
-                                 : kv_cache_k[layer][t];
+        const int8_t* src = is_v ? kv_cache_v[layer][head_id][t]
+                                 : kv_cache_k[layer][head_id][t];
         for (int j = 0; j < vec_len; j++) {
             sram0_write(dst_addr + t * vec_len + j, (uint8_t)src[j]);
         }
@@ -393,7 +412,8 @@ void handle_kv_command() {
 }
 
 // =============================================================================
-// Generate microcode for one transformer block
+// Generate microcode for one transformer block (full-recompute, no KV cache)
+// Multi-head attention: 4 heads, HEAD_DIM=16, HIDDEN=64
 // Returns number of instructions written
 // =============================================================================
 int gen_block_microcode(int S, int ucode_addr) {
@@ -413,69 +433,85 @@ int gen_block_microcode(int S, int ucode_addr) {
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // GEMM Q = LN1_out * Wq
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_Q, ADDR_LN1_OUT, ADDR_WQ,
-                 S, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
+    // GEMM Q_full = LN1_out * Wq  [S,64]*[64,64] -> [S,64]
+    // Output goes to ADDR_Q_H temporarily (will be sliced per-head)
+    // Actually: compute full [S,64] Q, then per-head loop uses slices
+    // We compute Q = LN1*WQ into a temp area, then per-head attention
+    // But we only have ADDR_Q_H for [S,16]. We need the full [S,64] Q.
+    // Strategy: compute full QKV [S,64] into ADDR_ATTN area (temp), then
+    // per-head loop extracts slices. Actually, simpler: do QKV GEMMs
+    // producing full [S,64], then for each head, slice out columns.
+    // The hardware GEMM with head-blocked weights already produces per-head:
+    //   WQ is stored as [HEADS][HIDDEN][HEAD_DIM] = head-blocked
+    //   So GEMM LN1 * WQ_h gives [S][HEAD_DIM] directly.
 
-    // BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+    // Per-head attention loop
+    for (int h = 0; h < HEADS; h++) {
+        uint16_t wq_h = ADDR_WQ + h * HIDDEN * HEAD_DIM;
+        uint16_t wk_h = ADDR_WK + h * HIDDEN * HEAD_DIM;
+        uint16_t wv_h = ADDR_WV + h * HIDDEN * HEAD_DIM;
 
-    // GEMM K = LN1_out * Wk
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_K, ADDR_LN1_OUT, ADDR_WK,
-                 S, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM Q_h = LN1_out * WQ_h  [S,64]*[64,16] -> [S,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_Q_H, ADDR_LN1_OUT, wq_h,
+                     S, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM K_h = LN1_out * WK_h  [S,64]*[64,16] -> [S,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_K_H, ADDR_LN1_OUT, wk_h,
+                     S, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // GEMM V = LN1_out * Wv
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_V, ADDR_LN1_OUT, ADDR_WV,
-                 S, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM V_h = LN1_out * WV_h  [S,64]*[64,16] -> [S,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_V_H, ADDR_LN1_OUT, wv_h,
+                     S, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM S = Q_h * K_h^T  [S,16]*[S,16]^T -> [S,S]
+        encode_instr(OP_GEMM, FLAG_TRANSPOSE_B | FLAG_REQUANT, ADDR_S, ADDR_Q_H, ADDR_K_H,
+                     S, S, HEAD_DIM, GEMM_IMM_K16, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // GEMM S = Q * K^T
-    encode_instr(OP_GEMM, FLAG_TRANSPOSE_B | FLAG_REQUANT, ADDR_S, ADDR_Q, ADDR_K,
-                 S, S, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // Softmax rows (S rows with causal mask)
+        for (int i = 0; i < S; i++) {
+            uint16_t src = ADDR_S + i * S;
+            uint16_t dst = ADDR_P + i * S;
+            uint16_t sm_imm = ((uint16_t)S) << 8;
+            encode_instr(OP_SOFTMAX, FLAG_CAUSAL_MASK, dst, src, 0,
+                         0, S, i, sm_imm, hi, lo);
+            ucode_write(addr++, hi, lo);
+        }
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM ATTN_h = P * V_h  [S,S]*[S,16] -> [S,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_ATTN_H, ADDR_P, ADDR_V_H,
+                     S, HEAD_DIM, S, GEMM_IMM_KS, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // Softmax rows (S rows with causal mask)
-    for (int i = 0; i < S; i++) {
-        uint16_t src = ADDR_S + i * S;
-        uint16_t dst = ADDR_P + i * S;
-        // K field = causal_limit (i), imm encodes row length upper byte
-        uint16_t sm_imm = ((uint16_t)S) << 8;
-        encode_instr(OP_SOFTMAX, FLAG_CAUSAL_MASK, dst, src, 0,
-                     0, S, i, sm_imm, hi, lo);
+        // COPY2D: scatter ATTN_h [S,16] into ATTN [S,64] at column h*HEAD_DIM
+        // VEC with FLAG_COPY2D: src0=ADDR_ATTN_H, dst=ADDR_ATTN+h*HEAD_DIM
+        // length=HEAD_DIM (cols), M=S (rows), K=HEAD_DIM (src stride), imm=HIDDEN (dst stride)
+        encode_instr(OP_VEC, FLAG_COPY2D,
+                     ADDR_ATTN + h * HEAD_DIM, ADDR_ATTN_H, 0,
+                     S, HEAD_DIM, HEAD_DIM, HIDDEN, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
         ucode_write(addr++, hi, lo);
     }
 
-    // BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-
-    // GEMM ATTN = P * V
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_ATTN, ADDR_P, ADDR_V,
-                 S, HIDDEN, S, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-
-    // BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-
-    // GEMM WO_out = ATTN * Wo
+    // GEMM WO_out = ATTN * Wo  [S,64]*[64,64] -> [S,64]
     encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_WO_OUT, ADDR_ATTN, ADDR_WO,
-                 S, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
+                 S, HIDDEN, HIDDEN, GEMM_IMM_K64, hi, lo);
     ucode_write(addr++, hi, lo);
 
     // BARRIER
@@ -513,9 +549,9 @@ int gen_block_microcode(int S, int ucode_addr) {
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // GEMM FFN1 = LN2_out * W1  (N-tiled: 8x64x16 -> 4 N-tiles)
+    // GEMM FFN1 = LN2_out * W1
     encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_FFN1, ADDR_LN2_OUT, ADDR_W1,
-                 S, FFN_DIM, HIDDEN, GEMM_IMM, hi, lo);
+                 S, FFN_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
     ucode_write(addr++, hi, lo);
 
     // BARRIER
@@ -531,7 +567,7 @@ int gen_block_microcode(int S, int ucode_addr) {
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // GEMM FFN2 = GELU_out * W2  (K-tiled: 8x16x64 -> 4 K-tiles)
+    // GEMM FFN2 = GELU_out * W2
     encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_FFN2, ADDR_FFN1, ADDR_W2,
                  S, HIDDEN, FFN_DIM, GEMM_IMM, hi, lo);
     ucode_write(addr++, hi, lo);
@@ -589,11 +625,11 @@ int gen_lm_head_microcode(int ucode_addr) {
     int addr = ucode_addr;
 
     // GEMM: logits = input * lm_head^T
-    // input at ADDR_LM_INPUT [1][16], weight at ADDR_LM_WEIGHT [256][16]
+    // input at ADDR_LM_INPUT [1][64], weight at ADDR_LM_WEIGHT [256][64]
     // output at ADDR_LM_OUTPUT [1][256]
     encode_instr(OP_GEMM, FLAG_TRANSPOSE_B | FLAG_REQUANT,
                  ADDR_LM_OUTPUT, ADDR_LM_INPUT, ADDR_LM_WEIGHT,
-                 1, VOCAB_SIZE, HIDDEN, GEMM_IMM, hi, lo);
+                 1, VOCAB_SIZE, HIDDEN, GEMM_IMM_K64, hi, lo);
     ucode_write(addr++, hi, lo);
 
     // BARRIER
@@ -610,6 +646,8 @@ int gen_lm_head_microcode(int ucode_addr) {
 // =============================================================================
 // Generate PREFILL block microcode: same as gen_block_microcode but adds
 // KV_APPEND instructions after K and V GEMMs to populate the KV cache.
+// Multi-head: per-head QKV GEMMs, score, softmax, context, COPY2D scatter,
+// and KV_APPEND per head.
 // =============================================================================
 int gen_prefill_block_microcode(int S, int blk_idx, int ucode_addr) {
     uint64_t hi, lo;
@@ -626,76 +664,91 @@ int gen_prefill_block_microcode(int S, int blk_idx, int ucode_addr) {
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // GEMM Q = LN1_out * Wq
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_Q, ADDR_LN1_OUT, ADDR_WQ,
-                 S, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+    // Per-head attention loop with KV_APPEND
+    for (int h = 0; h < HEADS; h++) {
+        uint16_t wq_h = ADDR_WQ + h * HIDDEN * HEAD_DIM;
+        uint16_t wk_h = ADDR_WK + h * HIDDEN * HEAD_DIM;
+        uint16_t wv_h = ADDR_WV + h * HIDDEN * HEAD_DIM;
 
-    // GEMM K = LN1_out * Wk
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_K, ADDR_LN1_OUT, ADDR_WK,
-                 S, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM Q_h = LN1_out * WQ_h  [S,64]*[64,16] -> [S,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_Q_H, ADDR_LN1_OUT, wq_h,
+                     S, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // GEMM V = LN1_out * Wv
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_V, ADDR_LN1_OUT, ADDR_WV,
-                 S, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM K_h = LN1_out * WK_h  [S,64]*[64,16] -> [S,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_K_H, ADDR_LN1_OUT, wk_h,
+                     S, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // KV_APPEND: store K[0..S-1] into KV cache
-    for (int i = 0; i < S; i++) {
-        // KV_APPEND K: src0=ADDR_K+i*H, M=layer, K=time_i, N=HIDDEN, flags=0(K), imm=0(head)
-        encode_instr(OP_KV_APPEND, 0x00, 0, ADDR_K + i * HIDDEN, 0,
-                     blk_idx, HIDDEN, i, 0, hi, lo);
+        // GEMM V_h = LN1_out * WV_h  [S,64]*[64,16] -> [S,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_V_H, ADDR_LN1_OUT, wv_h,
+                     S, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // KV_APPEND: store K_h[0..S-1] into KV cache for this head
+        for (int i = 0; i < S; i++) {
+            // KV_APPEND K: src0=ADDR_K_H+i*HEAD_DIM, M=layer, K=time_i, N=HEAD_DIM, flags=0(K), imm=head
+            encode_instr(OP_KV_APPEND, 0x00, 0, ADDR_K_H + i * HEAD_DIM, 0,
+                         blk_idx, HEAD_DIM, i, h, hi, lo);
+            ucode_write(addr++, hi, lo);
+        }
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // KV_APPEND: store V_h[0..S-1] into KV cache for this head
+        for (int i = 0; i < S; i++) {
+            // KV_APPEND V: flags=0x01(V), imm=head
+            encode_instr(OP_KV_APPEND, 0x01, 0, ADDR_V_H + i * HEAD_DIM, 0,
+                         blk_idx, HEAD_DIM, i, h, hi, lo);
+            ucode_write(addr++, hi, lo);
+        }
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // GEMM S = Q_h * K_h^T  [S,16]*[S,16]^T -> [S,S]
+        encode_instr(OP_GEMM, FLAG_TRANSPOSE_B | FLAG_REQUANT, ADDR_S, ADDR_Q_H, ADDR_K_H,
+                     S, S, HEAD_DIM, GEMM_IMM_K16, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // Softmax rows (S rows with causal mask)
+        for (int i = 0; i < S; i++) {
+            uint16_t src = ADDR_S + i * S;
+            uint16_t dst = ADDR_P + i * S;
+            uint16_t sm_imm = ((uint16_t)S) << 8;
+            encode_instr(OP_SOFTMAX, FLAG_CAUSAL_MASK, dst, src, 0,
+                         0, S, i, sm_imm, hi, lo);
+            ucode_write(addr++, hi, lo);
+        }
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // GEMM ATTN_h = P * V_h  [S,S]*[S,16] -> [S,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_ATTN_H, ADDR_P, ADDR_V_H,
+                     S, HEAD_DIM, S, GEMM_IMM_KS, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // COPY2D: scatter ATTN_h [S,16] into ATTN [S,64] at column h*HEAD_DIM
+        encode_instr(OP_VEC, FLAG_COPY2D,
+                     ADDR_ATTN + h * HEAD_DIM, ADDR_ATTN_H, 0,
+                     S, HEAD_DIM, HEAD_DIM, HIDDEN, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
         ucode_write(addr++, hi, lo);
     }
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
 
-    // KV_APPEND: store V[0..S-1] into KV cache
-    for (int i = 0; i < S; i++) {
-        // KV_APPEND V: flags=0x01(V)
-        encode_instr(OP_KV_APPEND, 0x01, 0, ADDR_V + i * HIDDEN, 0,
-                     blk_idx, HIDDEN, i, 0, hi, lo);
-        ucode_write(addr++, hi, lo);
-    }
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-
-    // GEMM S = Q * K^T
-    encode_instr(OP_GEMM, FLAG_TRANSPOSE_B | FLAG_REQUANT, ADDR_S, ADDR_Q, ADDR_K,
-                 S, S, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-
-    // Softmax rows (S rows with causal mask)
-    for (int i = 0; i < S; i++) {
-        uint16_t src = ADDR_S + i * S;
-        uint16_t dst = ADDR_P + i * S;
-        uint16_t sm_imm = ((uint16_t)S) << 8;
-        encode_instr(OP_SOFTMAX, FLAG_CAUSAL_MASK, dst, src, 0,
-                     0, S, i, sm_imm, hi, lo);
-        ucode_write(addr++, hi, lo);
-    }
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-
-    // GEMM ATTN = P * V
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_ATTN, ADDR_P, ADDR_V,
-                 S, HIDDEN, S, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-
-    // GEMM WO_out = ATTN * Wo
+    // GEMM WO_out = ATTN * Wo  [S,64]*[64,64] -> [S,64]
     encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_WO_OUT, ADDR_ATTN, ADDR_WO,
-                 S, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
+                 S, HIDDEN, HIDDEN, GEMM_IMM_K64, hi, lo);
     ucode_write(addr++, hi, lo);
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
@@ -727,7 +780,7 @@ int gen_prefill_block_microcode(int S, int blk_idx, int ucode_addr) {
 
     // GEMM FFN1 = LN2_out * W1
     encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_FFN1, ADDR_LN2_OUT, ADDR_W1,
-                 S, FFN_DIM, HIDDEN, GEMM_IMM, hi, lo);
+                 S, FFN_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
     ucode_write(addr++, hi, lo);
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
@@ -762,6 +815,7 @@ int gen_prefill_block_microcode(int S, int blk_idx, int ucode_addr) {
 
 // =============================================================================
 // Generate DECODE block microcode: single-token attention using KV cache
+// Multi-head: per-head decode with KV cache
 // T = total sequence positions including new token (e.g. prompt_len + step)
 // blk_idx = transformer block index (layer)
 // =============================================================================
@@ -777,79 +831,94 @@ int gen_decode_block_microcode(int T, int blk_idx, int ucode_addr) {
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // GEMM Q_new = LN1_out * WQ  (M=1)
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_DEC_Q, ADDR_DEC_LN1_OUT, ADDR_WQ,
-                 1, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+    // Per-head attention loop for decode
+    for (int h = 0; h < HEADS; h++) {
+        uint16_t wq_h = ADDR_WQ + h * HIDDEN * HEAD_DIM;
+        uint16_t wk_h = ADDR_WK + h * HIDDEN * HEAD_DIM;
+        uint16_t wv_h = ADDR_WV + h * HIDDEN * HEAD_DIM;
 
-    // GEMM K_new = LN1_out * WK  (M=1)
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_DEC_K_NEW, ADDR_DEC_LN1_OUT, ADDR_WK,
-                 1, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM Q_h = LN1_out * WQ_h  [1,64]*[64,16] -> [1,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_DEC_Q_H, ADDR_DEC_LN1_OUT, wq_h,
+                     1, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // GEMM V_new = LN1_out * WV  (M=1)
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_DEC_V_NEW, ADDR_DEC_LN1_OUT, ADDR_WV,
-                 1, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM K_new_h = LN1_out * WK_h  [1,64]*[64,16] -> [1,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_DEC_K_NEW, ADDR_DEC_LN1_OUT, wk_h,
+                     1, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // KV_APPEND K_new at position T
-    encode_instr(OP_KV_APPEND, 0x00, 0, ADDR_DEC_K_NEW, 0,
-                 blk_idx, HIDDEN, T, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM V_new_h = LN1_out * WV_h  [1,64]*[64,16] -> [1,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_DEC_V_NEW, ADDR_DEC_LN1_OUT, wv_h,
+                     1, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // KV_APPEND V_new at position T
-    encode_instr(OP_KV_APPEND, 0x01, 0, ADDR_DEC_V_NEW, 0,
-                 blk_idx, HIDDEN, T, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // KV_APPEND K_new_h at position T, head h
+        encode_instr(OP_KV_APPEND, 0x00, 0, ADDR_DEC_K_NEW, 0,
+                     blk_idx, HEAD_DIM, T, h, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // KV_READ: load K_cache[0..T] into SRAM0
-    encode_instr(OP_KV_READ, 0x00, ADDR_DEC_K_CACHE, 0, 0,
-                 blk_idx, HIDDEN, T_len, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // KV_APPEND V_new_h at position T, head h
+        encode_instr(OP_KV_APPEND, 0x01, 0, ADDR_DEC_V_NEW, 0,
+                     blk_idx, HEAD_DIM, T, h, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // KV_READ: load V_cache[0..T] into SRAM0
-    encode_instr(OP_KV_READ, 0x01, ADDR_DEC_V_CACHE, 0, 0,
-                 blk_idx, HIDDEN, T_len, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // KV_READ: load K_cache_h[0..T] into SRAM0
+        encode_instr(OP_KV_READ, 0x00, ADDR_DEC_K_CACHE, 0, 0,
+                     blk_idx, HEAD_DIM, T_len, h, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // GEMM S = Q_new * K_cache^T  (M=1, N=T_len, K=HIDDEN)
-    encode_instr(OP_GEMM, FLAG_TRANSPOSE_B | FLAG_REQUANT,
-                 ADDR_DEC_S, ADDR_DEC_Q, ADDR_DEC_K_CACHE,
-                 1, T_len, HIDDEN, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // KV_READ: load V_cache_h[0..T] into SRAM0
+        encode_instr(OP_KV_READ, 0x01, ADDR_DEC_V_CACHE, 0, 0,
+                     blk_idx, HEAD_DIM, T_len, h, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // Softmax (single row, length T_len, causal_limit=T)
-    uint16_t sm_imm = ((uint16_t)T_len) << 8;
-    encode_instr(OP_SOFTMAX, FLAG_CAUSAL_MASK, ADDR_DEC_P, ADDR_DEC_S, 0,
-                 0, T_len, T, sm_imm, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM S = Q_h * K_cache_h^T  [1,16]*[T_len,16]^T -> [1,T_len]
+        encode_instr(OP_GEMM, FLAG_TRANSPOSE_B | FLAG_REQUANT,
+                     ADDR_DEC_S, ADDR_DEC_Q_H, ADDR_DEC_K_CACHE,
+                     1, T_len, HEAD_DIM, GEMM_IMM_K16, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // GEMM ATTN = P * V_cache  (M=1, N=HIDDEN, K=T_len)
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_DEC_ATTN, ADDR_DEC_P, ADDR_DEC_V_CACHE,
-                 1, HIDDEN, T_len, GEMM_IMM, hi, lo);
-    ucode_write(addr++, hi, lo);
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // Softmax (single row, length T_len, causal_limit=T)
+        uint16_t sm_imm = ((uint16_t)T_len) << 8;
+        encode_instr(OP_SOFTMAX, FLAG_CAUSAL_MASK, ADDR_DEC_P, ADDR_DEC_S, 0,
+                     0, T_len, T, sm_imm, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // GEMM WO_out = ATTN * Wo  (M=1)
+        // GEMM ATTN_h = P * V_cache_h  [1,T_len]*[T_len,16] -> [1,16]
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_DEC_ATTN_H, ADDR_DEC_P, ADDR_DEC_V_CACHE,
+                     1, HEAD_DIM, T_len, GEMM_IMM_KS, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // COPY2D: scatter ATTN_h [1,16] into ATTN [1,64] at column h*HEAD_DIM
+        encode_instr(OP_VEC, FLAG_COPY2D,
+                     ADDR_DEC_ATTN + h * HEAD_DIM, ADDR_DEC_ATTN_H, 0,
+                     1, HEAD_DIM, HEAD_DIM, HIDDEN, hi, lo);
+        ucode_write(addr++, hi, lo);
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+    }
+
+    // GEMM WO_out = ATTN * Wo  [1,64]*[64,64] -> [1,64]
     encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_DEC_WO_OUT, ADDR_DEC_ATTN, ADDR_WO,
-                 1, HIDDEN, HIDDEN, GEMM_IMM, hi, lo);
+                 1, HIDDEN, HIDDEN, GEMM_IMM_K64, hi, lo);
     ucode_write(addr++, hi, lo);
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
@@ -877,7 +946,7 @@ int gen_decode_block_microcode(int T, int blk_idx, int ucode_addr) {
 
     // GEMM FFN1 = LN2_out * W1  (M=1, N=FFN_DIM, K=HIDDEN)
     encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_DEC_FFN1, ADDR_DEC_LN2_OUT, ADDR_W1,
-                 1, FFN_DIM, HIDDEN, GEMM_IMM, hi, lo);
+                 1, FFN_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
     ucode_write(addr++, hi, lo);
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
@@ -946,18 +1015,21 @@ int run_until_done(int max_cycles = 2000000) {
 
 // =============================================================================
 // Load block weights into SRAM0 + SRAM1
+// WQ/WK/WV are loaded as flat bytes (already head-blocked in weights.bin)
 // =============================================================================
 void load_block_to_srams(int blk_idx, const int8_t* x_data, int S) {
     const BlockWeights& bw = block_weights[blk_idx];
 
-    // SRAM0: weights
+    // SRAM0: weights - load wq/wk/wv as flat bytes (head-blocked layout)
+    for (int i = 0; i < HIDDEN * HIDDEN; i++) {
+        sram0_write(ADDR_WQ + i, (uint8_t)bw.wq[i]);
+        sram0_write(ADDR_WK + i, (uint8_t)bw.wk[i]);
+        sram0_write(ADDR_WV + i, (uint8_t)bw.wv[i]);
+    }
+
     for (int i = 0; i < HIDDEN; i++)
-        for (int j = 0; j < HIDDEN; j++) {
-            sram0_write(ADDR_WQ + i * HIDDEN + j, (uint8_t)bw.wq[i * HIDDEN + j]);
-            sram0_write(ADDR_WK + i * HIDDEN + j, (uint8_t)bw.wk[i * HIDDEN + j]);
-            sram0_write(ADDR_WV + i * HIDDEN + j, (uint8_t)bw.wv[i * HIDDEN + j]);
+        for (int j = 0; j < HIDDEN; j++)
             sram0_write(ADDR_WO + i * HIDDEN + j, (uint8_t)bw.wo[i * HIDDEN + j]);
-        }
 
     for (int i = 0; i < HIDDEN; i++)
         for (int j = 0; j < FFN_DIM; j++)
@@ -995,18 +1067,21 @@ void read_block_output(int S, int8_t* out) {
 
 // =============================================================================
 // Load block weights + single-token activation for decode mode
+// WQ/WK/WV are loaded as flat bytes (already head-blocked in weights.bin)
 // =============================================================================
 void load_decode_block_to_srams(int blk_idx, const int8_t* x_data) {
     const BlockWeights& bw = block_weights[blk_idx];
 
-    // SRAM0: weights (same addresses as prefill)
+    // SRAM0: weights - load wq/wk/wv as flat bytes (head-blocked layout)
+    for (int i = 0; i < HIDDEN * HIDDEN; i++) {
+        sram0_write(ADDR_WQ + i, (uint8_t)bw.wq[i]);
+        sram0_write(ADDR_WK + i, (uint8_t)bw.wk[i]);
+        sram0_write(ADDR_WV + i, (uint8_t)bw.wv[i]);
+    }
+
     for (int i = 0; i < HIDDEN; i++)
-        for (int j = 0; j < HIDDEN; j++) {
-            sram0_write(ADDR_WQ + i * HIDDEN + j, (uint8_t)bw.wq[i * HIDDEN + j]);
-            sram0_write(ADDR_WK + i * HIDDEN + j, (uint8_t)bw.wk[i * HIDDEN + j]);
-            sram0_write(ADDR_WV + i * HIDDEN + j, (uint8_t)bw.wv[i * HIDDEN + j]);
+        for (int j = 0; j < HIDDEN; j++)
             sram0_write(ADDR_WO + i * HIDDEN + j, (uint8_t)bw.wo[i * HIDDEN + j]);
-        }
 
     for (int i = 0; i < HIDDEN; i++)
         for (int j = 0; j < FFN_DIM; j++)

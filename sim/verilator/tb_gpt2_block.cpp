@@ -1,7 +1,7 @@
 // =============================================================================
-// tb_gpt2_block.cpp - GPT-2 transformer block integration test
-// Full pipeline: LN1 -> QKV -> Attention -> Wo -> Residual -> LN2 -> FFN -> Residual
-// Real engines: softmax, layernorm, gelu, vec, GEMM (all 8 on HW via tiling)
+// tb_gpt2_block.cpp - GPT-2 transformer block integration test (multi-head)
+// Full pipeline: LN1 -> MHA(4 heads) -> Wo -> Residual -> LN2 -> FFN -> Residual
+// Real engines: softmax, layernorm, gelu, vec, GEMM (all on HW via tiling)
 // C++ shims: DMA only
 // =============================================================================
 
@@ -40,39 +40,43 @@ static int               tc = 0;
 // Dimensions
 // =============================================================================
 static const int SEQ_LEN  = 8;
-static const int HIDDEN   = 16;
+static const int HIDDEN   = 64;
 static const int HEAD_DIM = 16;
-static const int HEADS    = 1;
-static const int FFN_DIM  = 64;
+static const int N_HEADS  = 4;
+static const int FFN_DIM  = 256;
 
 // =============================================================================
 // SRAM0 Memory layout (byte addresses)
 // =============================================================================
-static const uint16_t ADDR_X       = 0x0000;  // [8][16] = 128B
-static const uint16_t ADDR_WQ      = 0x0100;  // [16][16] = 256B
-static const uint16_t ADDR_WK      = 0x0200;  // [16][16] = 256B
-static const uint16_t ADDR_WV      = 0x0300;  // [16][16] = 256B
-static const uint16_t ADDR_WO      = 0x0400;  // [16][16] = 256B
-static const uint16_t ADDR_W1      = 0x0500;  // [16][64] = 1024B -> 0x08FF
-static const uint16_t ADDR_W2      = 0x0900;  // [64][16] = 1024B -> 0x0CFF
-static const uint16_t ADDR_LN1_OUT = 0x0D00;  // [8][16] = 128B
-static const uint16_t ADDR_Q       = 0x0D80;  // [8][16] = 128B
-static const uint16_t ADDR_K       = 0x0E00;  // [8][16] = 128B
-static const uint16_t ADDR_V       = 0x0E80;  // [8][16] = 128B
-static const uint16_t ADDR_S       = 0x0F00;  // [8][8] = 64B
-static const uint16_t ADDR_P       = 0x0F40;  // [8][8] = 64B
-static const uint16_t ADDR_ATTN    = 0x0F80;  // [8][16] = 128B
-static const uint16_t ADDR_WO_OUT  = 0x1000;  // [8][16] = 128B
-static const uint16_t ADDR_X2      = 0x1080;  // [8][16] = 128B
-static const uint16_t ADDR_LN2_OUT = 0x1100;  // [8][16] = 128B
-static const uint16_t ADDR_FFN1    = 0x1180;  // [8][64] = 512B -> 0x137F (GELU in-place)
-static const uint16_t ADDR_FFN2    = 0x1380;  // [8][16] = 128B
-static const uint16_t ADDR_X_OUT   = 0x1400;  // [8][16] = 128B
+// Weights (head-blocked QKV):
+static const uint16_t ADDR_WQ      = 0x0000;  // 4x[64,16] = 4096B (head-blocked)
+static const uint16_t ADDR_WK      = 0x1000;  // 4x[64,16] = 4096B (head-blocked)
+static const uint16_t ADDR_WV      = 0x2000;  // 4x[64,16] = 4096B (head-blocked)
+static const uint16_t ADDR_WO      = 0x3000;  // [64][64]  = 4096B
+static const uint16_t ADDR_W1      = 0x4000;  // [64][256] = 16384B
+static const uint16_t ADDR_W2      = 0x8000;  // [256][64] = 16384B
+
+// Activations:
+static const uint16_t ADDR_X       = 0xC000;  // [8][64]   = 512B
+static const uint16_t ADDR_LN1_OUT = 0xC400;  // [8][64]   = 512B
+static const uint16_t ADDR_Q_H     = 0xC800;  // [8][16]   = 128B  (per-head, reused)
+static const uint16_t ADDR_K_H     = 0xC900;  // [8][16]   = 128B  (per-head, reused)
+static const uint16_t ADDR_V_H     = 0xCA00;  // [8][16]   = 128B  (per-head, reused)
+static const uint16_t ADDR_S       = 0xCB00;  // [8][8]    = 64B   (per-head, reused)
+static const uint16_t ADDR_P       = 0xCC00;  // [8][8]    = 64B   (per-head, reused)
+static const uint16_t ADDR_ATTN_H  = 0xCD00;  // [8][16]   = 128B  (per-head context temp)
+static const uint16_t ADDR_ATTN    = 0xCE00;  // [8][64]   = 512B  (concat destination)
+static const uint16_t ADDR_WO_OUT  = 0xD200;  // [8][64]   = 512B
+static const uint16_t ADDR_X2      = 0xD600;  // [8][64]   = 512B
+static const uint16_t ADDR_LN2_OUT = 0xDA00;  // [8][64]   = 512B
+static const uint16_t ADDR_FFN1    = 0xDE00;  // [8][256]  = 2048B
+static const uint16_t ADDR_FFN2    = 0xEE00;  // [8][64]   = 512B
+static const uint16_t ADDR_X_OUT   = 0xF200;  // [8][64]   = 512B
 
 // SRAM1 Memory layout
-static const uint16_t S1_LN1_BETA  = 0x0000;  // [16]
-static const uint16_t S1_LN2_BETA  = 0x0010;  // [16]
-static const uint16_t S1_RESID     = 0x0100;  // [8][16] = 128B (residual source)
+static const uint16_t S1_LN1_BETA  = 0x0000;  // [64]
+static const uint16_t S1_LN2_BETA  = 0x0040;  // [64]
+static const uint16_t S1_RESID     = 0x0100;  // [8][64] = 512B (residual source)
 
 // =============================================================================
 // Opcodes and Flags
@@ -88,7 +92,14 @@ static const uint8_t OP_END       = 255;
 
 static const uint8_t FLAG_TRANSPOSE_B = 0x01;
 static const uint8_t FLAG_REQUANT     = 0x04;
+static const uint8_t FLAG_COPY2D      = 0x04;  // flags[2] for VEC COPY2D mode
 static const uint8_t FLAG_CAUSAL_MASK = 0x10;
+
+// =============================================================================
+// GEMM IMM values (different per GEMM type)
+// =============================================================================
+static const uint16_t GEMM_IMM_K64 = 0x0901;  // scale=1, shift=9, for K=64
+static const uint16_t GEMM_IMM_K16 = 0x0701;  // scale=1, shift=7, for K=16 (score/context)
 
 // =============================================================================
 // Debug dump flag
@@ -394,23 +405,29 @@ void vec_add_golden(const int8_t* src0, const int8_t* src1, int8_t* dst, int len
 // Test Data
 // =============================================================================
 static int8_t X[SEQ_LEN][HIDDEN];
-static int8_t Wq[HIDDEN][HIDDEN];
-static int8_t Wk[HIDDEN][HIDDEN];
-static int8_t Wv[HIDDEN][HIDDEN];
-static int8_t Wo[HIDDEN][HIDDEN];
-static int8_t W1[HIDDEN][FFN_DIM];
-static int8_t W2[FFN_DIM][HIDDEN];
+
+// Weights stored head-blocked: 4 contiguous [64,16] blocks for QKV
+static int8_t Wq[N_HEADS * HIDDEN][HEAD_DIM];  // [256][16] stored as 4x[64,16]
+static int8_t Wk[N_HEADS * HIDDEN][HEAD_DIM];  // [256][16] stored as 4x[64,16]
+static int8_t Wv[N_HEADS * HIDDEN][HEAD_DIM];  // [256][16] stored as 4x[64,16]
+static int8_t Wo[HIDDEN][HIDDEN];               // [64][64]
+static int8_t W1[HIDDEN][FFN_DIM];              // [64][256]
+static int8_t W2[FFN_DIM][HIDDEN];              // [256][64]
 static int8_t LN1_beta[HIDDEN];
 static int8_t LN2_beta[HIDDEN];
 
 // Golden intermediates
 static int8_t LN1_out_gold[SEQ_LEN][HIDDEN];
-static int8_t Q_gold[SEQ_LEN][HIDDEN];
-static int8_t K_gold[SEQ_LEN][HIDDEN];
-static int8_t V_gold[SEQ_LEN][HIDDEN];
-static int8_t S_gold[SEQ_LEN][SEQ_LEN];
-static int8_t P_gold[SEQ_LEN][SEQ_LEN];
-static int8_t ATTN_gold[SEQ_LEN][HIDDEN];
+
+// Per-head golden intermediates
+static int8_t Q_h_gold[SEQ_LEN][HEAD_DIM];
+static int8_t K_h_gold[SEQ_LEN][HEAD_DIM];
+static int8_t V_h_gold[SEQ_LEN][HEAD_DIM];
+static int8_t S_h_gold[SEQ_LEN][SEQ_LEN];
+static int8_t P_h_gold[SEQ_LEN][SEQ_LEN];
+static int8_t ATTN_h_gold[SEQ_LEN][HEAD_DIM];
+static int8_t ATTN_gold[SEQ_LEN][HIDDEN];  // concat of all heads
+
 static int8_t WO_out_gold[SEQ_LEN][HIDDEN];
 static int8_t X2_gold[SEQ_LEN][HIDDEN];
 static int8_t LN2_out_gold[SEQ_LEN][HIDDEN];
@@ -430,13 +447,18 @@ void generate_data_and_golden() {
         for (int j = 0; j < HIDDEN; j++)
             X[i][j] = (int8_t)((rand() % 21) - 10);
 
+    // Generate head-blocked QKV weights: 4 heads, each [64,16]
+    for (int h = 0; h < N_HEADS; h++)
+        for (int i = 0; i < HIDDEN; i++)
+            for (int j = 0; j < HEAD_DIM; j++) {
+                Wq[h * HIDDEN + i][j] = (int8_t)((rand() % 11) - 5);
+                Wk[h * HIDDEN + i][j] = (int8_t)((rand() % 11) - 5);
+                Wv[h * HIDDEN + i][j] = (int8_t)((rand() % 11) - 5);
+            }
+
     for (int i = 0; i < HIDDEN; i++)
-        for (int j = 0; j < HIDDEN; j++) {
-            Wq[i][j] = (int8_t)((rand() % 11) - 5);
-            Wk[i][j] = (int8_t)((rand() % 11) - 5);
-            Wv[i][j] = (int8_t)((rand() % 11) - 5);
+        for (int j = 0; j < HIDDEN; j++)
             Wo[i][j] = (int8_t)((rand() % 11) - 5);
-        }
 
     for (int i = 0; i < HIDDEN; i++)
         for (int j = 0; j < FFN_DIM; j++)
@@ -451,70 +473,85 @@ void generate_data_and_golden() {
         LN2_beta[j] = (int8_t)((rand() % 21) - 10);
     }
 
-    int scale = 1, shift = 7;
+    int scale_k64 = 1, shift_k64 = 9;  // for K=64 GEMMs
+    int scale_k16 = 1, shift_k16 = 7;  // for K=16 GEMMs (score/context)
 
     // Step 1: LayerNorm 1 (per row)
     for (int r = 0; r < SEQ_LEN; r++)
         layernorm_golden(&X[r][0], &LN1_out_gold[r][0], HIDDEN, LN1_beta);
 
-    // Step 2: Q = LN1_out * Wq
-    gemm_golden(&LN1_out_gold[0][0], &Wq[0][0], &Q_gold[0][0],
-                SEQ_LEN, HIDDEN, HIDDEN, false, scale, shift);
+    // Step 2: Multi-head attention loop
+    memset(&ATTN_gold[0][0], 0, sizeof(ATTN_gold));
+    for (int h = 0; h < N_HEADS; h++) {
+        // Wq_h is at Wq[h*HIDDEN .. (h+1)*HIDDEN-1][0..HEAD_DIM-1]
+        int8_t* Wq_h = &Wq[h * HIDDEN][0];
+        int8_t* Wk_h = &Wk[h * HIDDEN][0];
+        int8_t* Wv_h = &Wv[h * HIDDEN][0];
 
-    // Step 3: K = LN1_out * Wk
-    gemm_golden(&LN1_out_gold[0][0], &Wk[0][0], &K_gold[0][0],
-                SEQ_LEN, HIDDEN, HIDDEN, false, scale, shift);
+        // Q_h = LN1_out * Wq_h  [8,64] x [64,16] -> [8,16]
+        gemm_golden(&LN1_out_gold[0][0], Wq_h, &Q_h_gold[0][0],
+                    SEQ_LEN, HEAD_DIM, HIDDEN, false, scale_k64, shift_k64);
 
-    // Step 4: V = LN1_out * Wv
-    gemm_golden(&LN1_out_gold[0][0], &Wv[0][0], &V_gold[0][0],
-                SEQ_LEN, HIDDEN, HIDDEN, false, scale, shift);
+        // K_h = LN1_out * Wk_h
+        gemm_golden(&LN1_out_gold[0][0], Wk_h, &K_h_gold[0][0],
+                    SEQ_LEN, HEAD_DIM, HIDDEN, false, scale_k64, shift_k64);
 
-    // Step 5: S = Q * K^T
-    gemm_golden(&Q_gold[0][0], &K_gold[0][0], &S_gold[0][0],
-                SEQ_LEN, SEQ_LEN, HIDDEN, true, scale, shift);
+        // V_h = LN1_out * Wv_h
+        gemm_golden(&LN1_out_gold[0][0], Wv_h, &V_h_gold[0][0],
+                    SEQ_LEN, HEAD_DIM, HIDDEN, false, scale_k64, shift_k64);
 
-    // Step 6: P = softmax(S) per row with causal mask
-    for (int r = 0; r < SEQ_LEN; r++)
-        softmax_golden(&S_gold[r][0], &P_gold[r][0], SEQ_LEN, true, r);
+        // S_h = Q_h * K_h^T  [8,16] x [16,8]^T -> [8,8]
+        gemm_golden(&Q_h_gold[0][0], &K_h_gold[0][0], &S_h_gold[0][0],
+                    SEQ_LEN, SEQ_LEN, HEAD_DIM, true, scale_k16, shift_k16);
 
-    // Step 7: ATTN = P * V
-    gemm_golden(&P_gold[0][0], &V_gold[0][0], &ATTN_gold[0][0],
-                SEQ_LEN, HIDDEN, SEQ_LEN, false, scale, shift);
+        // P_h = softmax(S_h, causal)
+        for (int r = 0; r < SEQ_LEN; r++)
+            softmax_golden(&S_h_gold[r][0], &P_h_gold[r][0], SEQ_LEN, true, r);
 
-    // Step 8: WO_out = ATTN * Wo
+        // ATTN_h = P_h * V_h  [8,8] x [8,16] -> [8,16]
+        gemm_golden(&P_h_gold[0][0], &V_h_gold[0][0], &ATTN_h_gold[0][0],
+                    SEQ_LEN, HEAD_DIM, SEQ_LEN, false, scale_k16, shift_k16);
+
+        // Scatter ATTN_h into ATTN_concat[:, h*16:(h+1)*16]
+        for (int r = 0; r < SEQ_LEN; r++)
+            for (int c = 0; c < HEAD_DIM; c++)
+                ATTN_gold[r][h * HEAD_DIM + c] = ATTN_h_gold[r][c];
+    }
+
+    // Step 3: WO_out = ATTN_concat * Wo  [8,64] x [64,64] -> [8,64]
     gemm_golden(&ATTN_gold[0][0], &Wo[0][0], &WO_out_gold[0][0],
-                SEQ_LEN, HIDDEN, HIDDEN, false, scale, shift);
+                SEQ_LEN, HIDDEN, HIDDEN, false, scale_k64, shift_k64);
 
-    // Step 9: X2 = X + WO_out (residual add)
+    // Step 4: X2 = X + WO_out (residual add)
     vec_add_golden(&WO_out_gold[0][0], &X[0][0], &X2_gold[0][0], SEQ_LEN * HIDDEN);
 
-    // Step 10: LayerNorm 2 (per row)
+    // Step 5: LayerNorm 2 (per row)
     for (int r = 0; r < SEQ_LEN; r++)
         layernorm_golden(&X2_gold[r][0], &LN2_out_gold[r][0], HIDDEN, LN2_beta);
 
-    // Step 11: FFN1 = LN2_out * W1
+    // Step 6: FFN1 = LN2_out * W1  [8,64] x [64,256] -> [8,256]
     gemm_golden(&LN2_out_gold[0][0], &W1[0][0], &FFN1_gold[0][0],
-                SEQ_LEN, FFN_DIM, HIDDEN, false, scale, shift);
+                SEQ_LEN, FFN_DIM, HIDDEN, false, scale_k64, shift_k64);
 
-    // Step 12: GELU
+    // Step 7: GELU
     gelu_golden(&FFN1_gold[0][0], &GELU_gold[0][0], SEQ_LEN * FFN_DIM);
 
-    // Step 13: FFN2 = GELU_out * W2
+    // Step 8: FFN2 = GELU_out * W2  [8,256] x [256,64] -> [8,64]
     gemm_golden(&GELU_gold[0][0], &W2[0][0], &FFN2_gold[0][0],
-                SEQ_LEN, HIDDEN, FFN_DIM, false, scale, shift);
+                SEQ_LEN, HIDDEN, FFN_DIM, false, scale_k64, shift_k64);
 
-    // Step 14: X_OUT = X2 + FFN2 (residual add)
+    // Step 9: X_OUT = X2 + FFN2 (residual add)
     vec_add_golden(&FFN2_gold[0][0], &X2_gold[0][0], &X_OUT_gold[0][0], SEQ_LEN * HIDDEN);
 }
 
 // =============================================================================
-// Load microcode program (52 instructions)
+// Load microcode program (multi-head attention)
 // =============================================================================
 int load_microcode() {
     uint64_t hi, lo;
     int addr = 0;
 
-    // 0-7: LayerNorm 1 (8 rows)
+    // ---- LayerNorm 1 (8 rows) ----
     for (int i = 0; i < SEQ_LEN; i++) {
         uint16_t src = ADDR_X + i * HIDDEN;
         uint16_t dst = ADDR_LN1_OUT + i * HIDDEN;
@@ -523,96 +560,120 @@ int load_microcode() {
         ucode_write(addr++, hi, lo);
     }
 
-    // 8: BARRIER
+    // BARRIER
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 9: GEMM Q = LN1_out * Wq
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_Q, ADDR_LN1_OUT, ADDR_WQ,
-                 SEQ_LEN, HIDDEN, HIDDEN, 0x0701, hi, lo);
-    ucode_write(addr++, hi, lo);
+    // ---- Per-head attention loop (4 heads) ----
+    for (int h = 0; h < N_HEADS; h++) {
+        uint16_t wq_h_addr = ADDR_WQ + h * HIDDEN * HEAD_DIM;  // h * 1024
+        uint16_t wk_h_addr = ADDR_WK + h * HIDDEN * HEAD_DIM;
+        uint16_t wv_h_addr = ADDR_WV + h * HIDDEN * HEAD_DIM;
 
-    // 10: BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM Q_h = LN1_OUT * Wq_h  (M=8, N=16, K=64, imm=0x0901)
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_Q_H, ADDR_LN1_OUT, wq_h_addr,
+                     SEQ_LEN, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // 11: GEMM K = LN1_out * Wk
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_K, ADDR_LN1_OUT, ADDR_WK,
-                 SEQ_LEN, HIDDEN, HIDDEN, 0x0701, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // BARRIER
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // 12: BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM K_h = LN1_OUT * Wk_h  (M=8, N=16, K=64, imm=0x0901)
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_K_H, ADDR_LN1_OUT, wk_h_addr,
+                     SEQ_LEN, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // 13: GEMM V = LN1_out * Wv
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_V, ADDR_LN1_OUT, ADDR_WV,
-                 SEQ_LEN, HIDDEN, HIDDEN, 0x0701, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // BARRIER
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // 14: BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM V_h = LN1_OUT * Wv_h  (M=8, N=16, K=64, imm=0x0901)
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_V_H, ADDR_LN1_OUT, wv_h_addr,
+                     SEQ_LEN, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // 15: GEMM S = Q * K^T
-    encode_instr(OP_GEMM, FLAG_TRANSPOSE_B | FLAG_REQUANT, ADDR_S, ADDR_Q, ADDR_K,
-                 SEQ_LEN, SEQ_LEN, HIDDEN, 0x0701, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // BARRIER
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // 16: BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
+        // GEMM S = Q_h * K_h^T  (M=8, N=8, K=16, imm=0x0701, TRANSPOSE_B)
+        encode_instr(OP_GEMM, FLAG_TRANSPOSE_B | FLAG_REQUANT, ADDR_S, ADDR_Q_H, ADDR_K_H,
+                     SEQ_LEN, SEQ_LEN, HEAD_DIM, GEMM_IMM_K16, hi, lo);
+        ucode_write(addr++, hi, lo);
 
-    // 17-24: SOFTMAX rows (8 rows with causal mask)
-    for (int i = 0; i < SEQ_LEN; i++) {
-        uint16_t src = ADDR_S + i * SEQ_LEN;
-        uint16_t dst = ADDR_P + i * SEQ_LEN;
-        encode_instr(OP_SOFTMAX, FLAG_CAUSAL_MASK, dst, src, 0,
-                     0, SEQ_LEN, i, 0x0100, hi, lo);
+        // BARRIER
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // SOFTMAX rows (8 rows with causal mask)
+        for (int i = 0; i < SEQ_LEN; i++) {
+            uint16_t src = ADDR_S + i * SEQ_LEN;
+            uint16_t dst = ADDR_P + i * SEQ_LEN;
+            encode_instr(OP_SOFTMAX, FLAG_CAUSAL_MASK, dst, src, 0,
+                         0, SEQ_LEN, i, 0x0100, hi, lo);
+            ucode_write(addr++, hi, lo);
+        }
+
+        // BARRIER
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // GEMM ATTN_h = P * V_h  (M=8, N=16, K=8, imm=0x0701)
+        encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_ATTN_H, ADDR_P, ADDR_V_H,
+                     SEQ_LEN, HEAD_DIM, SEQ_LEN, GEMM_IMM_K16, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // BARRIER
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // VEC COPY2D: scatter ATTN_H -> ATTN[:, h*16:(h+1)*16]
+        //   opcode=VEC, flags=FLAG_COPY2D (0x04)
+        //   src0=ADDR_ATTN_H, dst=ADDR_ATTN + h*HEAD_DIM
+        //   N=HEAD_DIM (=16, number of columns / length)
+        //   M=SEQ_LEN (=8, number of rows)
+        //   K=HEAD_DIM (=16, src stride)
+        //   imm=HIDDEN (=64, dst stride)
+        encode_instr(OP_VEC, FLAG_COPY2D, ADDR_ATTN + h * HEAD_DIM, ADDR_ATTN_H, 0,
+                     SEQ_LEN, HEAD_DIM, HEAD_DIM, HIDDEN, hi, lo);
+        ucode_write(addr++, hi, lo);
+
+        // BARRIER
+        encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
         ucode_write(addr++, hi, lo);
     }
 
-    // 25: BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-
-    // 26: GEMM ATTN = P * V
-    encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_ATTN, ADDR_P, ADDR_V,
-                 SEQ_LEN, HIDDEN, SEQ_LEN, 0x0701, hi, lo);
-    ucode_write(addr++, hi, lo);
-
-    // 27: BARRIER
-    encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
-    ucode_write(addr++, hi, lo);
-
-    // 28: GEMM WO_out = ATTN * Wo
+    // ---- Output projection ----
+    // GEMM WO_OUT = ATTN * Wo  (M=8, N=64, K=64, imm=0x0901)
     encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_WO_OUT, ADDR_ATTN, ADDR_WO,
-                 SEQ_LEN, HIDDEN, HIDDEN, 0x0701, hi, lo);
+                 SEQ_LEN, HIDDEN, HIDDEN, GEMM_IMM_K64, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 29: BARRIER
+    // BARRIER
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 30: VEC ADD: X2 = WO_out + X (src0=WO_OUT in SRAM0, src1=X in SRAM1, dst=X2 in SRAM0)
+    // ---- Residual 1 ----
+    // VEC ADD: X2 = WO_OUT + X  (src0=WO_OUT in SRAM0, src1=S1_RESID in SRAM1)
     encode_instr(OP_VEC, 0x00, ADDR_X2, ADDR_WO_OUT, S1_RESID,
                  0, SEQ_LEN * HIDDEN, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 31: BARRIER
+    // BARRIER
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 32: DMA_LOAD: copy X2 from SRAM0 to SRAM1 for second residual
+    // ---- DMA: copy X2 to SRAM1 for second residual ----
     encode_instr(OP_DMA_LOAD, 0, S1_RESID, ADDR_X2, 0,
                  0, SEQ_LEN * HIDDEN, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 33: BARRIER
+    // BARRIER
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 34-41: LayerNorm 2 (8 rows)
+    // ---- LayerNorm 2 (8 rows) ----
     for (int i = 0; i < SEQ_LEN; i++) {
         uint16_t src = ADDR_X2 + i * HIDDEN;
         uint16_t dst = ADDR_LN2_OUT + i * HIDDEN;
@@ -621,47 +682,48 @@ int load_microcode() {
         ucode_write(addr++, hi, lo);
     }
 
-    // 42: BARRIER
+    // BARRIER
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 43: GEMM FFN1 = LN2_out * W1
+    // ---- FFN ----
+    // GEMM FFN1 = LN2_OUT * W1  (M=8, N=256, K=64, imm=0x0901)
     encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_FFN1, ADDR_LN2_OUT, ADDR_W1,
-                 SEQ_LEN, FFN_DIM, HIDDEN, 0x0701, hi, lo);
+                 SEQ_LEN, FFN_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 44: BARRIER
+    // BARRIER
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 45: GELU in-place on FFN1
+    // GELU in-place on FFN1
     encode_instr(OP_GELU, 0, ADDR_FFN1, ADDR_FFN1, 0,
                  0, SEQ_LEN * FFN_DIM, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 46: BARRIER
+    // BARRIER
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 47: GEMM FFN2 = GELU_out * W2
+    // GEMM FFN2 = GELU_out * W2  (M=8, N=64, K=256, imm=0x0901)
     encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_FFN2, ADDR_FFN1, ADDR_W2,
-                 SEQ_LEN, HIDDEN, FFN_DIM, 0x0701, hi, lo);
+                 SEQ_LEN, HIDDEN, FFN_DIM, GEMM_IMM_K64, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 48: BARRIER
+    // BARRIER
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 49: VEC ADD: X_OUT = FFN2 + X2 (src0=FFN2, src1=X2 in SRAM1, dst=X_OUT)
+    // VEC ADD: X_OUT = FFN2 + X2  (src0=FFN2, src1=S1_RESID in SRAM1)
     encode_instr(OP_VEC, 0x00, ADDR_X_OUT, ADDR_FFN2, S1_RESID,
                  0, SEQ_LEN * HIDDEN, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 50: BARRIER
+    // BARRIER
     encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
-    // 51: END
+    // END
     encode_instr(OP_END, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
     ucode_write(addr++, hi, lo);
 
@@ -672,34 +734,48 @@ int load_microcode() {
 // Load data to SRAMs
 // =============================================================================
 void load_data_to_srams() {
-    // SRAM0: X, Wq, Wk, Wv, Wo, W1, W2
+    // SRAM0: X
     for (int i = 0; i < SEQ_LEN; i++)
         for (int j = 0; j < HIDDEN; j++)
             sram0_write(ADDR_X + i * HIDDEN + j, (uint8_t)X[i][j]);
 
-    for (int i = 0; i < HIDDEN; i++)
-        for (int j = 0; j < HIDDEN; j++) {
-            sram0_write(ADDR_WQ + i * HIDDEN + j, (uint8_t)Wq[i][j]);
-            sram0_write(ADDR_WK + i * HIDDEN + j, (uint8_t)Wk[i][j]);
-            sram0_write(ADDR_WV + i * HIDDEN + j, (uint8_t)Wv[i][j]);
-            sram0_write(ADDR_WO + i * HIDDEN + j, (uint8_t)Wo[i][j]);
+    // SRAM0: Head-blocked Wq, Wk, Wv
+    // Each weight is stored as 4 contiguous [64,16] blocks
+    for (int h = 0; h < N_HEADS; h++) {
+        uint16_t wq_base = ADDR_WQ + h * HIDDEN * HEAD_DIM;
+        uint16_t wk_base = ADDR_WK + h * HIDDEN * HEAD_DIM;
+        uint16_t wv_base = ADDR_WV + h * HIDDEN * HEAD_DIM;
+        for (int i = 0; i < HIDDEN; i++) {
+            for (int j = 0; j < HEAD_DIM; j++) {
+                sram0_write(wq_base + i * HEAD_DIM + j, (uint8_t)Wq[h * HIDDEN + i][j]);
+                sram0_write(wk_base + i * HEAD_DIM + j, (uint8_t)Wk[h * HIDDEN + i][j]);
+                sram0_write(wv_base + i * HEAD_DIM + j, (uint8_t)Wv[h * HIDDEN + i][j]);
+            }
         }
+    }
 
+    // SRAM0: Wo [64][64]
+    for (int i = 0; i < HIDDEN; i++)
+        for (int j = 0; j < HIDDEN; j++)
+            sram0_write(ADDR_WO + i * HIDDEN + j, (uint8_t)Wo[i][j]);
+
+    // SRAM0: W1 [64][256]
     for (int i = 0; i < HIDDEN; i++)
         for (int j = 0; j < FFN_DIM; j++)
             sram0_write(ADDR_W1 + i * FFN_DIM + j, (uint8_t)W1[i][j]);
 
+    // SRAM0: W2 [256][64]
     for (int i = 0; i < FFN_DIM; i++)
         for (int j = 0; j < HIDDEN; j++)
             sram0_write(ADDR_W2 + i * HIDDEN + j, (uint8_t)W2[i][j]);
 
-    // SRAM1: LN1 beta, LN2 beta, X copy for first residual
+    // SRAM1: LN1 beta, LN2 beta
     for (int j = 0; j < HIDDEN; j++) {
         sram1_write(S1_LN1_BETA + j, (uint8_t)LN1_beta[j]);
         sram1_write(S1_LN2_BETA + j, (uint8_t)LN2_beta[j]);
     }
 
-    // Copy X to SRAM1 for first residual add (src1 of VEC_ADD)
+    // SRAM1: Copy X for first residual add (src1 of VEC_ADD)
     for (int i = 0; i < SEQ_LEN; i++)
         for (int j = 0; j < HIDDEN; j++)
             sram1_write(S1_RESID + i * HIDDEN + j, (uint8_t)X[i][j]);
@@ -736,6 +812,27 @@ VerifyResult verify_matrix(const char* name, uint16_t base_addr, const int8_t* g
     for (int i = 0; i < rows; i++) {
         for (int j = 0; j < cols; j++) {
             int8_t actual = (int8_t)sram0_read(base_addr + i * cols + j);
+            int err = abs((int)actual - (int)golden[i * cols + j]);
+            if (err > r.max_err) r.max_err = err;
+            if (err > tolerance) r.mismatches++;
+        }
+    }
+    std::cout << "  " << name << ": max_err=" << r.max_err
+              << " mismatches(>" << tolerance << ")=" << r.mismatches
+              << (r.mismatches == 0 ? " PASS" : " FAIL") << std::endl;
+    return r;
+}
+
+// Verify a strided (scattered) matrix in SRAM against a dense golden buffer.
+// SRAM layout: base_addr + row * sram_stride + col
+// Golden layout: golden[row * cols + col]
+VerifyResult verify_matrix_strided(const char* name, uint16_t base_addr,
+                                   int sram_stride, const int8_t* golden,
+                                   int rows, int cols, int tolerance = 0) {
+    VerifyResult r = {0, 0};
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            int8_t actual = (int8_t)sram0_read(base_addr + i * sram_stride + j);
             int err = abs((int)actual - (int)golden[i * cols + j]);
             if (err > r.max_err) r.max_err = err;
             if (err > tolerance) r.mismatches++;
@@ -796,10 +893,11 @@ int main(int argc, char** argv) {
     dut->dma_done_pulse = 0;
 
     std::cout << "============================================" << std::endl;
-    std::cout << "  GPT-2 BLOCK TEST: Full Transformer Block" << std::endl;
+    std::cout << "  GPT-2 BLOCK TEST: Multi-Head Attention" << std::endl;
     std::cout << "  seq_len=" << SEQ_LEN << " hidden=" << HIDDEN
+              << " head_dim=" << HEAD_DIM << " heads=" << N_HEADS
               << " ffn=" << FFN_DIM << std::endl;
-    std::cout << "  HW GEMM: Q,K,V,S,ATTN,WO,FFN1,FFN2 (8x)" << std::endl;
+    std::cout << "  HW GEMM: 5/head x4 + Wo + FFN1 + FFN2 = 23" << std::endl;
     std::cout << "============================================" << std::endl;
 
     // Build LUTs
@@ -817,13 +915,16 @@ int main(int argc, char** argv) {
 
     // Print sample golden values
     std::cout << "  X[0]: ";
-    for (int j = 0; j < HIDDEN; j++) std::cout << (int)X[0][j] << " ";
+    for (int j = 0; j < std::min(HIDDEN, 16); j++) std::cout << (int)X[0][j] << " ";
+    if (HIDDEN > 16) std::cout << "...";
     std::cout << std::endl;
     std::cout << "  LN1_out[0]: ";
-    for (int j = 0; j < HIDDEN; j++) std::cout << (int)LN1_out_gold[0][j] << " ";
+    for (int j = 0; j < std::min(HIDDEN, 16); j++) std::cout << (int)LN1_out_gold[0][j] << " ";
+    if (HIDDEN > 16) std::cout << "...";
     std::cout << std::endl;
     std::cout << "  X_OUT_gold[0]: ";
-    for (int j = 0; j < HIDDEN; j++) std::cout << (int)X_OUT_gold[0][j] << " ";
+    for (int j = 0; j < std::min(HIDDEN, 16); j++) std::cout << (int)X_OUT_gold[0][j] << " ";
+    if (HIDDEN > 16) std::cout << "...";
     std::cout << std::endl;
 
     // Load microcode
@@ -851,7 +952,7 @@ int main(int argc, char** argv) {
     int vec_done_count = 0;
     int cycle = 0;
     bool done = false;
-    const int MAX_CYCLES = 500000;
+    const int MAX_CYCLES = 2000000;
 
     while (cycle < MAX_CYCLES && !done) {
         tick();
@@ -904,15 +1005,16 @@ int main(int argc, char** argv) {
     // ================================================================
     // Verification: "follow-actual" approach
     // Re-read SRAM intermediates and recompute golden from actual values.
-    // This verifies each engine step independently, regardless of LN
-    // golden precision (the counting divider is hard to replicate exactly).
+    // For multi-head: per-head buffers are reused, so we verify ATTN_concat
+    // (the full [8,64] scatter result) and everything downstream.
     // ================================================================
     std::cout << std::endl << "=== Verification (follow-actual) ===" << std::endl;
 
     // Verify all engines are idle before SRAM reads
     assert(dut->vec_busy_dbg == 0 && "VEC engine still busy at verification time!");
 
-    int scale = 1, shift = 7;
+    int scale_k64 = 1, shift_k64 = 9;
+    int scale_k16 = 1, shift_k16 = 7;
     bool all_pass = true;
 
     // Helper: read matrix from SRAM0 into buffer
@@ -927,98 +1029,90 @@ int main(int argc, char** argv) {
                                 SEQ_LEN, HIDDEN, 20);
     // LN precision mismatch is expected; don't fail on it
 
-    // 2. Read actual LN1_out, recompute Q/K/V from it
+    // 2. Read actual LN1_out from SRAM
     int8_t actual_ln1[SEQ_LEN][HIDDEN];
     read_sram_matrix(ADDR_LN1_OUT, SEQ_LEN, HIDDEN, &actual_ln1[0][0]);
 
+    // 3. Compute full multi-head golden from actual LN1 (all 4 heads, scatter into concat)
+    int8_t ref_attn_concat[SEQ_LEN][HIDDEN];
+    memset(&ref_attn_concat[0][0], 0, sizeof(ref_attn_concat));
 
-    int8_t ref_q[SEQ_LEN][HIDDEN], ref_k[SEQ_LEN][HIDDEN], ref_v[SEQ_LEN][HIDDEN];
-    gemm_golden(&actual_ln1[0][0], &Wq[0][0], &ref_q[0][0],
-                SEQ_LEN, HIDDEN, HIDDEN, false, scale, shift);
-    gemm_golden(&actual_ln1[0][0], &Wk[0][0], &ref_k[0][0],
-                SEQ_LEN, HIDDEN, HIDDEN, false, scale, shift);
-    gemm_golden(&actual_ln1[0][0], &Wv[0][0], &ref_v[0][0],
-                SEQ_LEN, HIDDEN, HIDDEN, false, scale, shift);
+    for (int h = 0; h < N_HEADS; h++) {
+        int8_t* Wq_h = &Wq[h * HIDDEN][0];
+        int8_t* Wk_h = &Wk[h * HIDDEN][0];
+        int8_t* Wv_h = &Wv[h * HIDDEN][0];
 
-    // HW GEMM: tolerance=0 (bit-exact match expected)
-    auto r_q = verify_matrix("Q (hw) ", ADDR_Q, &ref_q[0][0], SEQ_LEN, HIDDEN, 0);
-    auto r_k = verify_matrix("K (hw) ", ADDR_K, &ref_k[0][0], SEQ_LEN, HIDDEN, 0);
-    auto r_v = verify_matrix("V (hw) ", ADDR_V, &ref_v[0][0], SEQ_LEN, HIDDEN, 0);
-    if (r_q.mismatches || r_k.mismatches || r_v.mismatches) all_pass = false;
+        int8_t ref_qh[SEQ_LEN][HEAD_DIM];
+        int8_t ref_kh[SEQ_LEN][HEAD_DIM];
+        int8_t ref_vh[SEQ_LEN][HEAD_DIM];
+        int8_t ref_sh[SEQ_LEN][SEQ_LEN];
+        int8_t ref_ph[SEQ_LEN][SEQ_LEN];
+        int8_t ref_ah[SEQ_LEN][HEAD_DIM];
 
-    // Debug: print first row of Q, K, V
-    std::cout << std::endl;
-    std::cout << "  Q[0] actual: ";
-    for (int j = 0; j < HIDDEN; j++)
-        std::cout << (int)(int8_t)sram0_read(ADDR_Q + j) << " ";
-    std::cout << std::endl;
-    std::cout << "  Q[0] golden: ";
-    for (int j = 0; j < HIDDEN; j++)
-        std::cout << (int)ref_q[0][j] << " ";
-    std::cout << std::endl;
+        // Q_h = actual_ln1 * Wq_h  (scale=1, shift=9)
+        gemm_golden(&actual_ln1[0][0], Wq_h, &ref_qh[0][0],
+                    SEQ_LEN, HEAD_DIM, HIDDEN, false, scale_k64, shift_k64);
 
+        // K_h = actual_ln1 * Wk_h
+        gemm_golden(&actual_ln1[0][0], Wk_h, &ref_kh[0][0],
+                    SEQ_LEN, HEAD_DIM, HIDDEN, false, scale_k64, shift_k64);
 
-    std::cout << "  K[0] actual: ";
-    for (int j = 0; j < HIDDEN; j++)
-        std::cout << (int)(int8_t)sram0_read(ADDR_K + j) << " ";
-    std::cout << std::endl;
-    std::cout << "  K[0] golden: ";
-    for (int j = 0; j < HIDDEN; j++)
-        std::cout << (int)ref_k[0][j] << " ";
-    std::cout << std::endl;
+        // V_h = actual_ln1 * Wv_h
+        gemm_golden(&actual_ln1[0][0], Wv_h, &ref_vh[0][0],
+                    SEQ_LEN, HEAD_DIM, HIDDEN, false, scale_k64, shift_k64);
 
-    std::cout << "  V[0] actual: ";
-    for (int j = 0; j < HIDDEN; j++)
-        std::cout << (int)(int8_t)sram0_read(ADDR_V + j) << " ";
+        // S_h = Q_h * K_h^T  (scale=1, shift=7)
+        gemm_golden(&ref_qh[0][0], &ref_kh[0][0], &ref_sh[0][0],
+                    SEQ_LEN, SEQ_LEN, HEAD_DIM, true, scale_k16, shift_k16);
+
+        // P_h = softmax(S_h, causal)
+        for (int r = 0; r < SEQ_LEN; r++)
+            softmax_golden(&ref_sh[r][0], &ref_ph[r][0], SEQ_LEN, true, r);
+
+        // ATTN_h = P_h * V_h  (scale=1, shift=7)
+        gemm_golden(&ref_ph[0][0], &ref_vh[0][0], &ref_ah[0][0],
+                    SEQ_LEN, HEAD_DIM, SEQ_LEN, false, scale_k16, shift_k16);
+
+        // Scatter into concat buffer
+        for (int r = 0; r < SEQ_LEN; r++)
+            for (int c = 0; c < HEAD_DIM; c++)
+                ref_attn_concat[r][h * HEAD_DIM + c] = ref_ah[r][c];
+
+        // Debug: print first row of Q_h for head h
+        std::cout << "  Head " << h << " Q_h[0]: ";
+        for (int j = 0; j < HEAD_DIM; j++) std::cout << (int)ref_qh[0][j] << " ";
+        std::cout << std::endl;
+    }
+
+    // 4. Verify ATTN_concat at ADDR_ATTN
+    auto r_attn = verify_matrix("ATTN_concat", ADDR_ATTN, &ref_attn_concat[0][0],
+                                 SEQ_LEN, HIDDEN, 0);
+    if (r_attn.mismatches) all_pass = false;
+
+    // Debug: print first row of ATTN_concat
     std::cout << std::endl;
-    std::cout << "  V[0] golden: ";
-    for (int j = 0; j < HIDDEN; j++)
-        std::cout << (int)ref_v[0][j] << " ";
+    std::cout << "  ATTN_concat[0] actual: ";
+    for (int j = 0; j < std::min(HIDDEN, 16); j++)
+        std::cout << (int)(int8_t)sram0_read(ADDR_ATTN + j) << " ";
+    if (HIDDEN > 16) std::cout << "...";
+    std::cout << std::endl;
+    std::cout << "  ATTN_concat[0] golden: ";
+    for (int j = 0; j < std::min(HIDDEN, 16); j++)
+        std::cout << (int)ref_attn_concat[0][j] << " ";
+    if (HIDDEN > 16) std::cout << "...";
     std::cout << std::endl << std::endl;
 
-    // 3. Read actual Q, K -> recompute S
-    int8_t actual_q[SEQ_LEN][HIDDEN], actual_k[SEQ_LEN][HIDDEN];
-    read_sram_matrix(ADDR_Q, SEQ_LEN, HIDDEN, &actual_q[0][0]);
-    read_sram_matrix(ADDR_K, SEQ_LEN, HIDDEN, &actual_k[0][0]);
-
-    int8_t ref_s[SEQ_LEN][SEQ_LEN];
-    gemm_golden(&actual_q[0][0], &actual_k[0][0], &ref_s[0][0],
-                SEQ_LEN, SEQ_LEN, HIDDEN, true, scale, shift);
-    auto r_s = verify_matrix("S (hw) ", ADDR_S, &ref_s[0][0], SEQ_LEN, SEQ_LEN, 0);
-    if (r_s.mismatches) all_pass = false;
-
-    // 4. Read actual S -> recompute P (softmax with causal mask)
-    int8_t actual_s[SEQ_LEN][SEQ_LEN];
-    read_sram_matrix(ADDR_S, SEQ_LEN, SEQ_LEN, &actual_s[0][0]);
-
-    int8_t ref_p[SEQ_LEN][SEQ_LEN];
-    for (int r = 0; r < SEQ_LEN; r++)
-        softmax_golden(&actual_s[r][0], &ref_p[r][0], SEQ_LEN, true, r);
-    auto r_p = verify_matrix("P (hw) ", ADDR_P, &ref_p[0][0], SEQ_LEN, SEQ_LEN, 2);
-    if (r_p.mismatches) all_pass = false;
-
-    // 5. Read actual P, V -> recompute ATTN
-    int8_t actual_p[SEQ_LEN][SEQ_LEN], actual_v[SEQ_LEN][HIDDEN];
-    read_sram_matrix(ADDR_P, SEQ_LEN, SEQ_LEN, &actual_p[0][0]);
-    read_sram_matrix(ADDR_V, SEQ_LEN, HIDDEN, &actual_v[0][0]);
-
-    int8_t ref_attn[SEQ_LEN][HIDDEN];
-    gemm_golden(&actual_p[0][0], &actual_v[0][0], &ref_attn[0][0],
-                SEQ_LEN, HIDDEN, SEQ_LEN, false, scale, shift);
-    auto r_at = verify_matrix("ATTN(hw)", ADDR_ATTN, &ref_attn[0][0], SEQ_LEN, HIDDEN, 0);
-    if (r_at.mismatches) all_pass = false;
-
-    // 6. Read actual ATTN -> recompute WO_out
+    // 5. Read actual ATTN_concat -> recompute WO_out
     int8_t actual_attn[SEQ_LEN][HIDDEN];
     read_sram_matrix(ADDR_ATTN, SEQ_LEN, HIDDEN, &actual_attn[0][0]);
 
     int8_t ref_wo[SEQ_LEN][HIDDEN];
     gemm_golden(&actual_attn[0][0], &Wo[0][0], &ref_wo[0][0],
-                SEQ_LEN, HIDDEN, HIDDEN, false, scale, shift);
+                SEQ_LEN, HIDDEN, HIDDEN, false, scale_k64, shift_k64);
     auto r_wo = verify_matrix("WO(hw) ", ADDR_WO_OUT, &ref_wo[0][0], SEQ_LEN, HIDDEN, 0);
     if (r_wo.mismatches) all_pass = false;
 
-    // 7. Read actual WO_out -> verify X2 = WO_out + X (residual add)
+    // 6. Read actual WO_out -> verify X2 = WO_out + X (residual add)
     int8_t actual_wo[SEQ_LEN][HIDDEN];
     read_sram_matrix(ADDR_WO_OUT, SEQ_LEN, HIDDEN, &actual_wo[0][0]);
 
@@ -1027,7 +1121,7 @@ int main(int argc, char** argv) {
     auto r_x2 = verify_matrix("X2     ", ADDR_X2, &ref_x2[0][0], SEQ_LEN, HIDDEN, 0);
     if (r_x2.mismatches) all_pass = false;
 
-    // 8. LN2: informational comparison with tolerance
+    // 7. LN2: informational comparison with tolerance
     int8_t actual_x2[SEQ_LEN][HIDDEN];
     read_sram_matrix(ADDR_X2, SEQ_LEN, HIDDEN, &actual_x2[0][0]);
     int8_t ref_ln2[SEQ_LEN][HIDDEN];
@@ -1036,19 +1130,19 @@ int main(int argc, char** argv) {
     auto r_ln2 = verify_matrix("LN2_out", ADDR_LN2_OUT, &ref_ln2[0][0],
                                 SEQ_LEN, HIDDEN, 20);
 
-    // 9. Read actual LN2_out -> recompute FFN1 -> verify GELU(FFN1)
+    // 8. Read actual LN2_out -> recompute FFN1 -> verify GELU(FFN1)
     int8_t actual_ln2[SEQ_LEN][HIDDEN];
     read_sram_matrix(ADDR_LN2_OUT, SEQ_LEN, HIDDEN, &actual_ln2[0][0]);
 
     int8_t ref_ffn1[SEQ_LEN][FFN_DIM];
     gemm_golden(&actual_ln2[0][0], &W1[0][0], &ref_ffn1[0][0],
-                SEQ_LEN, FFN_DIM, HIDDEN, false, scale, shift);
+                SEQ_LEN, FFN_DIM, HIDDEN, false, scale_k64, shift_k64);
 
     if (DUMP_FFN) {
         dump_csv("ffn1_ln2_input.csv", &actual_ln2[0][0], SEQ_LEN, HIDDEN);
     }
 
-    // 10. GELU: compare SRAM (which has GELU applied in-place) against gelu(ref_ffn1)
+    // 9. GELU: compare SRAM (which has GELU applied in-place) against gelu(ref_ffn1)
     int8_t ref_gelu[SEQ_LEN][FFN_DIM];
     gelu_golden(&ref_ffn1[0][0], &ref_gelu[0][0], SEQ_LEN * FFN_DIM);
     auto r_ff1 = verify_matrix("FFN1+GELU(hw)", ADDR_FFN1, &ref_gelu[0][0], SEQ_LEN, FFN_DIM, 1);
@@ -1060,7 +1154,7 @@ int main(int argc, char** argv) {
         dump_csv("ffn1_output.csv", &actual_gelu_dump[0][0], SEQ_LEN, FFN_DIM);
     }
 
-    // 11. Read actual GELU output -> recompute FFN2
+    // 10. Read actual GELU output -> recompute FFN2
     int8_t actual_gelu[SEQ_LEN][FFN_DIM];
     read_sram_matrix(ADDR_FFN1, SEQ_LEN, FFN_DIM, &actual_gelu[0][0]);
 
@@ -1070,7 +1164,7 @@ int main(int argc, char** argv) {
 
     int8_t ref_ffn2[SEQ_LEN][HIDDEN];
     gemm_golden(&actual_gelu[0][0], &W2[0][0], &ref_ffn2[0][0],
-                SEQ_LEN, HIDDEN, FFN_DIM, false, scale, shift);
+                SEQ_LEN, HIDDEN, FFN_DIM, false, scale_k64, shift_k64);
     auto r_ff2 = verify_matrix("FFN2 (hw)", ADDR_FFN2, &ref_ffn2[0][0], SEQ_LEN, HIDDEN, 0);
     if (r_ff2.mismatches) all_pass = false;
 
@@ -1080,7 +1174,7 @@ int main(int argc, char** argv) {
         dump_csv("ffn2_output.csv", &actual_ffn2_dump[0][0], SEQ_LEN, HIDDEN);
     }
 
-    // 12. Read actual FFN2, X2 -> verify X_OUT = FFN2 + X2 (residual add)
+    // 11. Read actual FFN2, X2 -> verify X_OUT = FFN2 + X2 (residual add)
     int8_t actual_ffn2[SEQ_LEN][HIDDEN];
     read_sram_matrix(ADDR_FFN2, SEQ_LEN, HIDDEN, &actual_ffn2[0][0]);
 
@@ -1092,32 +1186,36 @@ int main(int argc, char** argv) {
     // Print first row of output
     std::cout << std::endl;
     std::cout << "  X_OUT[0] actual: ";
-    for (int j = 0; j < HIDDEN; j++)
+    for (int j = 0; j < std::min(HIDDEN, 16); j++)
         std::cout << (int)(int8_t)sram0_read(ADDR_X_OUT + j) << " ";
+    if (HIDDEN > 16) std::cout << "...";
     std::cout << std::endl;
     std::cout << "  X_OUT[0] golden: ";
-    for (int j = 0; j < HIDDEN; j++)
+    for (int j = 0; j < std::min(HIDDEN, 16); j++)
         std::cout << (int)ref_xout[0][j] << " ";
+    if (HIDDEN > 16) std::cout << "...";
     std::cout << std::endl;
 
     // ================================================================
     // Final verdict
+    // Expected: 23 HW GEMMs, 1 DMA, 32 softmax rows, 16 LN rows,
+    //           1 GELU, 6 vec (4 COPY2D + 2 ADD)
     // ================================================================
-    bool pass = all_pass && (hw_gemm_count == 8) && (dma_count == 1);
+    bool pass = all_pass && (hw_gemm_count == 23) && (dma_count == 1);
 
     std::cout << std::endl;
     std::cout << "============================================" << std::endl;
-    std::cout << "  HW GEMM done:      " << hw_gemm_count << "/8 "
-              << (hw_gemm_count == 8 ? "OK" : "FAIL") << std::endl;
+    std::cout << "  HW GEMM done:      " << hw_gemm_count << "/23 "
+              << (hw_gemm_count == 23 ? "OK" : "FAIL") << std::endl;
     std::cout << "  DMA commands:      " << dma_count << "/1 "
               << (dma_count == 1 ? "OK" : "FAIL") << std::endl;
-    std::cout << "  Softmax rows:      " << softmax_count << "/8" << std::endl;
+    std::cout << "  Softmax rows:      " << softmax_count << "/32" << std::endl;
     std::cout << "  LayerNorm rows:    " << layernorm_count << "/16" << std::endl;
     std::cout << "  GELU completions:  " << gelu_done_count << "/1" << std::endl;
-    std::cout << "  Vec completions:   " << vec_done_count << "/2" << std::endl;
+    std::cout << "  Vec completions:   " << vec_done_count << "/6" << std::endl;
     std::cout << "  X_OUT max error:   " << r_out.max_err << " (tol=0)" << std::endl;
     std::cout << "  Total cycles:      " << cycle << std::endl;
-    std::cout << "  GEMMs: " << hw_gemm_count << "/8 on REAL hardware" << std::endl;
+    std::cout << "  GEMMs: " << hw_gemm_count << "/23 on REAL hardware" << std::endl;
     std::cout << "============================================" << std::endl;
     std::cout << "  GPT-2 BLOCK TEST: " << (pass ? "PASS" : "FAIL") << std::endl;
     std::cout << "============================================" << std::endl;

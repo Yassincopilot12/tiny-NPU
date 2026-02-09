@@ -50,6 +50,9 @@ package isa_pkg;
     parameter int VEC_SCALE_SHIFT = 2;
     parameter int VEC_CLAMP       = 3;
 
+    // VEC mode selector (flags[2] for VEC)
+    parameter int VEC_COPY2D      = 4;  // flags[2] selects 2D scatter/gather mode
+
     // =========================================================================
     // Decoded Instruction Struct
     // =========================================================================

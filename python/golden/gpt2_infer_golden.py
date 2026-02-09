@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 from ddr_map import (HIDDEN, FFN_DIM, N_HEADS, HEAD_DIM, N_LAYERS,
                      VOCAB_SIZE, MAX_SEQ, GEMM_SCALE, GEMM_SHIFT,
+                     GEMM_SHIFT_K16,
                      BLOCKS_OFFSET, BLOCK_SIZE, BLK_LN1_BETA, BLK_WQ,
                      BLK_WK, BLK_WV, BLK_WO, BLK_LN2_BETA, BLK_W1, BLK_W2,
                      WTE_OFFSET, WPE_OFFSET, LN_F_OFFSET, LM_HEAD_OFFSET,
@@ -40,11 +41,20 @@ class TinyGPT2Golden:
         self.blocks = []
         for i in range(N_LAYERS):
             base = BLOCKS_OFFSET + i * BLOCK_SIZE
+            # WQ/WK/WV are head-blocked: [N_HEADS*HIDDEN, HEAD_DIM]
+            # stored as N_HEADS contiguous [HIDDEN, HEAD_DIM] blocks
+            wq_raw = buf[base + BLK_WQ : base + BLK_WQ + HIDDEN*HIDDEN].reshape(N_HEADS * HIDDEN, HEAD_DIM).copy()
+            wk_raw = buf[base + BLK_WK : base + BLK_WK + HIDDEN*HIDDEN].reshape(N_HEADS * HIDDEN, HEAD_DIM).copy()
+            wv_raw = buf[base + BLK_WV : base + BLK_WV + HIDDEN*HIDDEN].reshape(N_HEADS * HIDDEN, HEAD_DIM).copy()
+            # Split into per-head weight matrices [HIDDEN, HEAD_DIM]
+            wq_heads = [wq_raw[h*HIDDEN:(h+1)*HIDDEN, :] for h in range(N_HEADS)]
+            wk_heads = [wk_raw[h*HIDDEN:(h+1)*HIDDEN, :] for h in range(N_HEADS)]
+            wv_heads = [wv_raw[h*HIDDEN:(h+1)*HIDDEN, :] for h in range(N_HEADS)]
             blk = {
                 "ln1_beta": buf[base + BLK_LN1_BETA : base + BLK_LN1_BETA + HIDDEN].copy(),
-                "wq": buf[base + BLK_WQ : base + BLK_WQ + HIDDEN*HIDDEN].reshape(HIDDEN, HIDDEN).copy(),
-                "wk": buf[base + BLK_WK : base + BLK_WK + HIDDEN*HIDDEN].reshape(HIDDEN, HIDDEN).copy(),
-                "wv": buf[base + BLK_WV : base + BLK_WV + HIDDEN*HIDDEN].reshape(HIDDEN, HIDDEN).copy(),
+                "wq_heads": wq_heads,
+                "wk_heads": wk_heads,
+                "wv_heads": wv_heads,
                 "wo": buf[base + BLK_WO : base + BLK_WO + HIDDEN*HIDDEN].reshape(HIDDEN, HIDDEN).copy(),
                 "ln2_beta": buf[base + BLK_LN2_BETA : base + BLK_LN2_BETA + HIDDEN].copy(),
                 "w1": buf[base + BLK_W1 : base + BLK_W1 + HIDDEN*FFN_DIM].reshape(HIDDEN, FFN_DIM).copy(),
@@ -66,54 +76,69 @@ class TinyGPT2Golden:
         return emb
 
     def run_block(self, x, blk_idx):
-        """Run one transformer block (matching NPU microcode exactly)."""
+        """Run one transformer block with multi-head attention.
+
+        Processes heads sequentially, matching NPU microcode exactly:
+        - QKV projections use K=64, shift=9
+        - Score/context GEMMs use K=16, shift=7
+        - Per-head results scattered into concat buffer via COPY2D
+        """
         blk = self.blocks[blk_idx]
         S = x.shape[0]
-        scale, shift = GEMM_SCALE, GEMM_SHIFT
+        scale = GEMM_SCALE
+        shift_k64 = GEMM_SHIFT       # shift=9 for K=64 projections
+        shift_k16 = GEMM_SHIFT_K16   # shift=7 for K=16 score/context
 
         # 1. LayerNorm 1
         ln1_out = np.zeros_like(x)
         for s in range(S):
             ln1_out[s] = layernorm_fixed(x[s], beta=blk["ln1_beta"])
 
-        # 2. Q, K, V GEMMs
-        Q = gemm_int8(ln1_out, blk["wq"], scale=scale, shift=shift)
-        K = gemm_int8(ln1_out, blk["wk"], scale=scale, shift=shift)
-        V = gemm_int8(ln1_out, blk["wv"], scale=scale, shift=shift)
+        # 2. Multi-head attention (sequential per head)
+        ATTN_concat = np.zeros((S, HIDDEN), dtype=np.int8)
 
-        # 3. Attention scores: S_mat = Q * K^T
-        S_mat = gemm_int8(Q, K, transpose_b=True, scale=scale, shift=shift)
+        for h in range(N_HEADS):
+            # Per-head QKV projections: LN1_OUT[S,64] * Wq_h[64,16] -> Q_h[S,16]
+            Q_h = gemm_int8(ln1_out, blk["wq_heads"][h], scale=scale, shift=shift_k64)
+            K_h = gemm_int8(ln1_out, blk["wk_heads"][h], scale=scale, shift=shift_k64)
+            V_h = gemm_int8(ln1_out, blk["wv_heads"][h], scale=scale, shift=shift_k64)
 
-        # 4. Softmax (per row, causal mask)
-        P = np.zeros((S, S), dtype=np.int8)
-        for s in range(S):
-            causal = np.arange(S) <= s
-            P[s] = softmax_fixed(S_mat[s], causal_mask=causal)
+            # Score: S_mat = Q_h * K_h^T  [S,16] * [16,S] -> [S,S]
+            S_mat = gemm_int8(Q_h, K_h, transpose_b=True, scale=scale, shift=shift_k16)
 
-        # 5. Attention output: ATTN = P * V
-        ATTN = gemm_int8(P, V, scale=scale, shift=shift)
+            # Softmax (per row, causal mask)
+            P = np.zeros((S, S), dtype=np.int8)
+            for s in range(S):
+                causal = np.arange(S) <= s
+                P[s] = softmax_fixed(S_mat[s], causal_mask=causal)
 
-        # 6. Output projection: WO_out = ATTN * Wo
-        WO_out = gemm_int8(ATTN, blk["wo"], scale=scale, shift=shift)
+            # Context: ATTN_h = P * V_h  [S,S] * [S,16] -> [S,16]
+            ATTN_h = gemm_int8(P, V_h, scale=scale, shift=shift_k16)
 
-        # 7. Residual 1: X2 = WO_out + X
+            # Scatter (COPY2D): ATTN_concat[:, h*16:(h+1)*16] = ATTN_h
+            ATTN_concat[:, h * HEAD_DIM:(h + 1) * HEAD_DIM] = ATTN_h
+
+        # 3. Output projection: WO_out = ATTN_concat * Wo  [S,64] * [64,64]
+        WO_out = gemm_int8(ATTN_concat, blk["wo"], scale=scale, shift=shift_k64)
+
+        # 4. Residual 1: X2 = WO_out + X
         X2 = clamp_i8(WO_out.astype(np.int16) + x.astype(np.int16))
 
-        # 8. LayerNorm 2
+        # 5. LayerNorm 2
         ln2_out = np.zeros_like(X2)
         for s in range(S):
             ln2_out[s] = layernorm_fixed(X2[s], beta=blk["ln2_beta"])
 
-        # 9. FFN1 = LN2_out * W1
-        ffn1 = gemm_int8(ln2_out, blk["w1"], scale=scale, shift=shift)
+        # 6. FFN1 = LN2_out * W1
+        ffn1 = gemm_int8(ln2_out, blk["w1"], scale=scale, shift=shift_k64)
 
-        # 10. GELU
+        # 7. GELU
         gelu_out = gelu_fixed(ffn1)
 
-        # 11. FFN2 = GELU_out * W2
-        ffn2 = gemm_int8(gelu_out, blk["w2"], scale=scale, shift=shift)
+        # 8. FFN2 = GELU_out * W2
+        ffn2 = gemm_int8(gelu_out, blk["w2"], scale=scale, shift=shift_k64)
 
-        # 12. Residual 2: X_out = FFN2 + X2
+        # 9. Residual 2: X_out = FFN2 + X2
         X_out = clamp_i8(ffn2.astype(np.int16) + X2.astype(np.int16))
 
         return X_out

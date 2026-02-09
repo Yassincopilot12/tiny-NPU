@@ -20,6 +20,12 @@ module vec_engine (
     input  logic [7:0]          scale,        // for SCALE_SHIFT
     input  logic [7:0]          shift,        // for SCALE_SHIFT
 
+    // COPY2D mode (flags[2] = 1)
+    input  logic                copy2d_mode,  // flags[2]
+    input  logic [15:0]         cmd_M,        // number of rows (from instr.M)
+    input  logic [15:0]         cmd_K,        // src stride   (from instr.K)
+    input  logic [15:0]         cmd_imm,      // dst stride   (from instr.imm)
+
     // SRAM read port 0 (src0)
     output logic                sram_rd0_en,
     output logic [15:0]         sram_rd0_addr,
@@ -57,6 +63,12 @@ module vec_engine (
     logic [15:0] r_idx;
     logic signed [DATA_W-1:0] p_src0, p_src1;
 
+    // COPY2D registers
+    logic        r_copy2d;
+    logic [15:0] r_rows, r_cols;          // M rows, N cols (N = length)
+    logic [15:0] r_src_stride, r_dst_stride;
+    logic [15:0] r_row_idx, r_col_idx;
+
     // ----------------------------------------------------------------
     // FSM transition
     // ----------------------------------------------------------------
@@ -64,13 +76,22 @@ module vec_engine (
         if (!rst_n) state <= S_IDLE;
         else        state <= state_nxt;
 
+    // COPY2D completion: last row and last column
+    logic copy2d_last;
+    assign copy2d_last = (r_row_idx == r_rows - 16'd1) && (r_col_idx == r_cols - 16'd1);
+
     always_comb begin
         state_nxt = state;
         case (state)
             S_IDLE:    if (cmd_valid) state_nxt = S_READ;
             S_READ:    state_nxt = S_WAIT;
             S_WAIT:    state_nxt = S_PROCESS;
-            S_PROCESS: state_nxt = (r_idx == r_length - 16'd1) ? S_DONE : S_READ;
+            S_PROCESS: begin
+                if (r_copy2d)
+                    state_nxt = copy2d_last ? S_DONE : S_READ;
+                else
+                    state_nxt = (r_idx == r_length - 16'd1) ? S_DONE : S_READ;
+            end
             S_DONE:    state_nxt = S_IDLE;
             default:   state_nxt = S_IDLE;
         endcase
@@ -81,34 +102,64 @@ module vec_engine (
     // ----------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            r_opcode    <= '0;
-            r_length    <= '0;
-            r_src0_base <= '0;
-            r_src1_base <= '0;
-            r_dst_base  <= '0;
-            r_scale     <= '0;
-            r_shift     <= '0;
+            r_opcode     <= '0;
+            r_length     <= '0;
+            r_src0_base  <= '0;
+            r_src1_base  <= '0;
+            r_dst_base   <= '0;
+            r_scale      <= '0;
+            r_shift      <= '0;
+            r_copy2d     <= '0;
+            r_rows       <= '0;
+            r_cols       <= '0;
+            r_src_stride <= '0;
+            r_dst_stride <= '0;
         end else if (state == S_IDLE && cmd_valid) begin
-            r_opcode    <= opcode;
-            r_length    <= length;
-            r_src0_base <= src0_base;
-            r_src1_base <= src1_base;
-            r_dst_base  <= dst_base;
-            r_scale     <= scale;
-            r_shift     <= shift;
+            r_opcode     <= opcode;
+            r_length     <= length;
+            r_src0_base  <= src0_base;
+            r_src1_base  <= src1_base;
+            r_dst_base   <= dst_base;
+            r_scale      <= scale;
+            r_shift      <= shift;
+            r_copy2d     <= copy2d_mode;
+            r_rows       <= cmd_M;          // number of rows
+            r_cols       <= length;         // number of columns = length field
+            r_src_stride <= cmd_K;          // source row stride
+            r_dst_stride <= cmd_imm;        // destination row stride
         end
     end
 
     // ----------------------------------------------------------------
-    // Element index counter
+    // Element index counter (flat mode)
     // ----------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n)
         if (!rst_n)
             r_idx <= '0;
         else if (state == S_IDLE && cmd_valid)
             r_idx <= '0;
-        else if (state == S_PROCESS && state_nxt == S_READ)
+        else if (state == S_PROCESS && state_nxt == S_READ && !r_copy2d)
             r_idx <= r_idx + 16'd1;
+
+    // ----------------------------------------------------------------
+    // COPY2D row/col index counters
+    // ----------------------------------------------------------------
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            r_row_idx <= '0;
+            r_col_idx <= '0;
+        end else if (state == S_IDLE && cmd_valid) begin
+            r_row_idx <= '0;
+            r_col_idx <= '0;
+        end else if (state == S_PROCESS && state_nxt == S_READ && r_copy2d) begin
+            if (r_col_idx == r_cols - 16'd1) begin
+                r_col_idx <= '0;
+                r_row_idx <= r_row_idx + 16'd1;
+            end else begin
+                r_col_idx <= r_col_idx + 16'd1;
+            end
+        end
+    end
 
     // ----------------------------------------------------------------
     // Latch read data (available one cycle after read enable)
@@ -124,8 +175,9 @@ module vec_engine (
     // SRAM read addresses - issued during S_READ
     // ----------------------------------------------------------------
     assign sram_rd0_en   = (state == S_READ);
-    assign sram_rd0_addr = r_src0_base + r_idx;
-    assign sram_rd1_en   = (state == S_READ) && (r_opcode == OP_ADD || r_opcode == OP_MUL);
+    assign sram_rd0_addr = r_copy2d ? (r_src0_base + r_row_idx * r_src_stride + r_col_idx)
+                                    : (r_src0_base + r_idx);
+    assign sram_rd1_en   = (state == S_READ) && !r_copy2d && (r_opcode == OP_ADD || r_opcode == OP_MUL);
     assign sram_rd1_addr = r_src1_base + r_idx;
 
     // ----------------------------------------------------------------
@@ -175,8 +227,9 @@ module vec_engine (
     // SRAM write - during S_PROCESS
     // ----------------------------------------------------------------
     assign sram_wr_en   = (state == S_PROCESS);
-    assign sram_wr_addr = r_dst_base + r_idx;
-    assign sram_wr_data = result;
+    assign sram_wr_addr = r_copy2d ? (r_dst_base + r_row_idx * r_dst_stride + r_col_idx)
+                                   : (r_dst_base + r_idx);
+    assign sram_wr_data = r_copy2d ? p_src0[DATA_W-1:0] : result;
 
     // ----------------------------------------------------------------
     // Handshake and status

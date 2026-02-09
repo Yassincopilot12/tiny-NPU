@@ -79,7 +79,7 @@ module gpt2_block_top
     output wire                gelu_done_dbg,
     output wire                vec_busy_dbg,
     output wire                vec_done_dbg,
-    output wire  [3:0]         hw_gemm_done_count
+    output wire  [4:0]         hw_gemm_done_count
 );
 
     // ================================================================
@@ -376,14 +376,14 @@ module gpt2_block_top
     );
 
     // HW GEMM done counter
-    logic [3:0] hw_gemm_cnt;
+    logic [4:0] hw_gemm_cnt;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
-            hw_gemm_cnt <= 4'd0;
+            hw_gemm_cnt <= 5'd0;
         else if (start_pulse)
-            hw_gemm_cnt <= 4'd0;
+            hw_gemm_cnt <= 5'd0;
         else if (gm_done)
-            hw_gemm_cnt <= hw_gemm_cnt + 4'd1;
+            hw_gemm_cnt <= hw_gemm_cnt + 5'd1;
     end
     assign hw_gemm_done_count = hw_gemm_cnt;
 
@@ -762,6 +762,10 @@ module gpt2_block_top
         .dst_base        (vec_cmd_dst_dec),
         .scale           (vec_cmd_imm_dec[7:0]),
         .shift           (vec_cmd_imm_dec[15:8]),
+        .copy2d_mode     (vec_cmd_flags_dec[2]),
+        .cmd_M           (decoded_instr.M),
+        .cmd_K           (decoded_instr.K),
+        .cmd_imm         (decoded_instr.imm),
         .sram_rd0_en     (ve_rd0_en),
         .sram_rd0_addr   (ve_rd0_addr),
         .sram_rd0_data   (ve_rd0_data),

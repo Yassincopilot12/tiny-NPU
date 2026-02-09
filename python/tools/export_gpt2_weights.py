@@ -5,7 +5,7 @@ import numpy as np
 
 # Add parent so we can import ddr_map
 sys.path.insert(0, os.path.dirname(__file__))
-from ddr_map import HIDDEN, FFN_DIM, N_LAYERS, VOCAB_SIZE, MAX_SEQ
+from ddr_map import HIDDEN, FFN_DIM, N_LAYERS, VOCAB_SIZE, MAX_SEQ, N_HEADS, HEAD_DIM
 
 
 def export(model_name="gpt2", outfile="gpt2_tiny_fp32.npz"):
@@ -32,11 +32,22 @@ def export(model_name="gpt2", outfile="gpt2_tiny_fp32.npz"):
         weights[f"block{i}.ln1.gamma"] = sd[pfx + "ln_1.weight"].numpy()[:H].copy()
         weights[f"block{i}.ln1.beta"]  = sd[pfx + "ln_1.bias"].numpy()[:H].copy()
 
-        # c_attn weight (768, 2304) -> Q,K,V each (16,16)
+        # c_attn weight (768, 2304) -> Q,K,V each [64,64] then head-blocked to [N_HEADS*64,16]
         ca_w = sd[pfx + "attn.c_attn.weight"].numpy()
-        weights[f"block{i}.wq"] = ca_w[:H, :H].copy()
-        weights[f"block{i}.wk"] = ca_w[:H, H_full:H_full + H].copy()
-        weights[f"block{i}.wv"] = ca_w[:H, 2*H_full:2*H_full + H].copy()
+        wq_full = ca_w[:H, :H].copy()                         # [64, 64]
+        wk_full = ca_w[:H, H_full:H_full + H].copy()          # [64, 64]
+        wv_full = ca_w[:H, 2*H_full:2*H_full + H].copy()      # [64, 64]
+
+        # Head-blocked layout: concatenate per-head [64,16] slices vertically
+        # Result shape: [N_HEADS*HIDDEN, HEAD_DIM] = [256, 16]
+        # In SRAM this is stored as 4 contiguous [64,16] blocks
+        hd = HEAD_DIM
+        wq_blocks = np.concatenate([wq_full[:, h*hd:(h+1)*hd] for h in range(N_HEADS)], axis=0)
+        wk_blocks = np.concatenate([wk_full[:, h*hd:(h+1)*hd] for h in range(N_HEADS)], axis=0)
+        wv_blocks = np.concatenate([wv_full[:, h*hd:(h+1)*hd] for h in range(N_HEADS)], axis=0)
+        weights[f"block{i}.wq"] = wq_blocks
+        weights[f"block{i}.wk"] = wk_blocks
+        weights[f"block{i}.wv"] = wv_blocks
 
         # c_proj weight (768, 768) -> (16, 16)
         weights[f"block{i}.wo"] = sd[pfx + "attn.c_proj.weight"].numpy()[:H, :H].copy()

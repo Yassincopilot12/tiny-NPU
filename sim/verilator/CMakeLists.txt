@@ -121,6 +121,7 @@ verilate(gpt2_block_sim
     TOP_MODULE gpt2_block_top
     PREFIX Vgpt2_block_top
     VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
+        -GSRAM0_DEPTH=65536
 )
 
 # ---- Target 5: GPT-2 Inference Demo ----

@@ -49,7 +49,7 @@ With this motivation in mind, we can strip away the complexity of production-gra
 4. **Memory Management** - How do you fit weights, activations, and intermediate results in limited on-chip SRAM?
 5. **KV-Cache Optimization** - How does caching key/value vectors make autoregressive decoding faster?
 
-The result: a chip that loads real GPT-2 weights from HuggingFace, runs INT8 quantized inference through 4 transformer layers, and generates text - all verified cycle-accurate against a Python golden model.
+The result: a chip that loads real GPT-2 weights from HuggingFace, runs INT8 quantized inference through 4 transformer layers with 4-head attention, and generates text - all verified cycle-accurate against a Python golden model.
 
 # Architecture
 
@@ -132,17 +132,21 @@ Unlike a GPU where a dispatcher distributes threads across cores, the NPU dispat
 
 tiny-npu uses two on-chip SRAM banks for all computation:
 
-**SRAM0 (64KB)** - The main workspace. Holds all weights for one transformer block (48KB) plus all intermediate activations (15KB). The memory map is carefully designed so that 6 weight matrices (Wq, Wk, Wv, Wo, W1, W2) and all intermediate tensors fit simultaneously:
+**SRAM0 (64KB)** - The main workspace. Holds all weights for one transformer block (48KB) plus all intermediate activations (~14KB). The memory map is carefully designed so that 6 weight matrices (Wq, Wk, Wv, Wo, W1, W2) and all intermediate tensors fit simultaneously.
+
+QKV weights use a **head-blocked layout**: each of Wq, Wk, Wv stores 4 contiguous `[64,16]` per-head slices rather than a single `[64,64]` matrix. This lets the microcode address each head's weights directly without reshaping.
+
+Per-head attention buffers (Q_H, K_H, V_H, S, P, ATTN_H) are only 256 bytes each and are **reused across heads**. After each head computes its attention output, a `COPY2D` instruction scatters the result into the correct columns of the full-width ATTN concat buffer.
 
 ```
-SRAM0 Memory Map (one transformer block)
-=========================================
+SRAM0 Memory Map (one transformer block, 4-head attention)
+===========================================================
 0x0000 +-----------+
-       |  Wq       |  4096B  [64][64]   Query weights
+       |  Wq       |  4096B  4x[64,16]  Query weights (head-blocked)
 0x1000 +-----------+
-       |  Wk       |  4096B  [64][64]   Key weights
+       |  Wk       |  4096B  4x[64,16]  Key weights (head-blocked)
 0x2000 +-----------+
-       |  Wv       |  4096B  [64][64]   Value weights
+       |  Wv       |  4096B  4x[64,16]  Value weights (head-blocked)
 0x3000 +-----------+
        |  Wo       |  4096B  [64][64]   Output projection
 0x4000 +-----------+
@@ -152,23 +156,24 @@ SRAM0 Memory Map (one transformer block)
 0xC000 +-----------+
        |  X        |  1024B  [16][64]   Input activations
 0xC400 |  LN1_OUT  |  1024B             LayerNorm output
-0xC800 |  Q        |  1024B             Query
-0xCC00 |  K        |  1024B             Key
-0xD000 |  V        |  1024B             Value
-0xD400 |  S        |   256B  [16][16]   Attention scores
-0xD500 |  P        |   256B  [16][16]   Softmax output
-0xD600 |  ATTN     |  1024B             Attention context
-0xDA00 |  WO_OUT   |  1024B             Output projection result
-0xDE00 |  X2       |  1024B             First residual
-0xE200 |  LN2_OUT  |  1024B             Second LayerNorm
-0xE600 |  FFN1     |  4096B  [16][256]  FFN up-project output
-0xF600 |  FFN2     |  1024B             FFN down-project output
-0xFA00 |  X_OUT    |  1024B             Block output
-0xFE00 +-----------+
-       Total: ~63.5KB of 64KB used
+0xC800 |  Q_H      |   256B  [16][16]   Per-head query (reused)
+0xC900 |  K_H      |   256B  [16][16]   Per-head key (reused)
+0xCA00 |  V_H      |   256B  [16][16]   Per-head value (reused)
+0xCB00 |  S        |   256B  [16][16]   Attention scores (reused)
+0xCC00 |  P        |   256B  [16][16]   Softmax output (reused)
+0xCD00 |  ATTN_H   |   256B  [16][16]   Per-head context (reused)
+0xCE00 |  ATTN     |  1024B  [16][64]   Concat attention (scatter dest)
+0xD200 |  WO_OUT   |  1024B             Output projection result
+0xD600 |  X2       |  1024B             First residual
+0xDA00 |  LN2_OUT  |  1024B             Second LayerNorm
+0xDE00 |  FFN1     |  4096B  [16][256]  FFN up-project output
+0xEE00 |  FFN2     |  1024B             FFN down-project output
+0xF200 |  X_OUT    |  1024B             Block output
+0xF600 +-----------+
+       Total: ~61.5KB of 64KB used
 ```
 
-Every byte has a purpose. The entire 64KB address space is utilized, with only ~512 bytes to spare. This tight packing is a direct consequence of the ISA using 16-bit address fields (max 64KB addressable).
+The head-blocked QKV layout keeps total weight size unchanged (3 x 4096B = 12KB for QKV) while enabling direct per-head addressing: head h's query weights are at `Wq + h * 1024`.
 
 **SRAM1 (8KB)** - Auxiliary storage for LayerNorm beta parameters and residual connections. Separated from SRAM0 because the vec engine needs to read from both SRAM0 and SRAM1 simultaneously for residual adds.
 
@@ -247,12 +252,13 @@ The GELU activation function approximated via a 256-entry lookup table mapping I
 
 ### Vec Engine (Engine 4)
 
-A general-purpose vector unit for elementwise operations:
+A general-purpose vector unit for elementwise and data movement operations:
 
 - **VEC_ADD** - Saturating INT8 addition (used for residual connections: `x + sublayer_output`)
 - **VEC_MUL** - Elementwise multiply
 - **VEC_SCALE_SHIFT** - Scale and shift
 - **VEC_CLAMP** - Clamp to range
+- **VEC_COPY2D** - 2D strided scatter/gather within SRAM0. Used to scatter per-head attention outputs (`[S,16]` with stride 16) into the concatenated attention buffer (`[S,64]` with stride 64). The M field sets the row count, K sets the source stride, and imm sets the destination stride.
 
 ### DMA Engine (Engine 5)
 
@@ -288,11 +294,11 @@ The fields serve different purposes depending on the opcode:
 | `dst` | Output address | Output address | Output address | SRAM address | SRAM address |
 | `src0` | Activation address | Input address | Input A address | DDR address | Cache address |
 | `src1` | Weight address | Beta (SRAM1) | Input B address | - | - |
-| `M` | Rows | Rows | Rows | Byte count | Layer ID |
-| `N` | Columns | Hidden dim | Length | - | Vector length |
-| `K` | Inner dim | - | - | - | Time position |
-| `imm` | scale\|shift | - | - | - | - |
-| `flags` | transpose, requant | causal mask | sub-op | direction | - |
+| `M` | Rows | Rows | Rows / COPY2D rows | Byte count | Layer ID |
+| `N` | Columns | Hidden dim | Length / COPY2D cols | - | Vector length |
+| `K` | Inner dim | - | COPY2D src stride | - | Time position |
+| `imm` | scale\|shift | - | COPY2D dst stride | - | Head ID |
+| `flags` | transpose, requant | causal mask | sub-op (bit2=COPY2D) | direction | is_v (bit0) |
 
 ### Opcodes
 
@@ -347,84 +353,92 @@ When an engine completes its operation, it pulses a `done` signal, clearing its 
 
 ### Transformer Block
 
-Here is the complete microcode program that executes one GPT-2 transformer block. This is the actual sequence of instructions that tiny-npu runs:
+Here is the complete microcode program that executes one GPT-2 transformer block with 4-head attention. This is the actual sequence of instructions that tiny-npu runs:
 
 ```asm
 ; =============================================
-; GPT-2 Transformer Block Microcode
+; GPT-2 Transformer Block Microcode (4-head)
 ; Input:  X[S, 64] in SRAM0 @ 0xC000
-; Output: X_OUT[S, 64] in SRAM0 @ 0xFA00
+; Output: X_OUT[S, 64] in SRAM0 @ 0xF200
 ; =============================================
 
 ; --- Pre-Attention LayerNorm ---
 LAYERNORM  dst=0xC400  src0=0xC000  src1=0x0000   M=S  N=64       ; LN1(X) -> LN1_OUT
 
-BARRIER                                                             ; wait for LN
+BARRIER
 
-; --- QKV Projections (3 GEMMs) ---
-GEMM       dst=0xC800  src0=0xC400  src1=0x0000   M=S  N=64  K=64  ; LN1_OUT * Wq -> Q
-GEMM       dst=0xCC00  src0=0xC400  src1=0x1000   M=S  N=64  K=64  ; LN1_OUT * Wk -> K
-GEMM       dst=0xD000  src0=0xC400  src1=0x2000   M=S  N=64  K=64  ; LN1_OUT * Wv -> V
+; --- Multi-Head Attention (4 heads, sequential) ---
+; Each head: QKV projection -> score -> softmax -> context -> scatter
+; Per-head buffers (Q_H, K_H, V_H, S, P, ATTN_H) are reused each iteration
 
-BARRIER                                                             ; wait for QKV
-
-; --- Attention Scores ---
-GEMM       dst=0xD400  src0=0xC800  src1=0xCC00   M=S  N=S   K=64  ; Q * K^T -> S
-                                                   flags=TRANSPOSE_B
+; Head 0: Wq_h0 @ 0x0000, Wk_h0 @ 0x1000, Wv_h0 @ 0x2000
+GEMM       dst=0xC800  src0=0xC400  src1=0x0000   M=S  N=16 K=64  ; LN1 * Wq_h0 -> Q_H
+BARRIER
+GEMM       dst=0xC900  src0=0xC400  src1=0x1000   M=S  N=16 K=64  ; LN1 * Wk_h0 -> K_H
+BARRIER
+GEMM       dst=0xCA00  src0=0xC400  src1=0x2000   M=S  N=16 K=64  ; LN1 * Wv_h0 -> V_H
+BARRIER
+GEMM       dst=0xCB00  src0=0xC800  src1=0xC900   M=S  N=S  K=16  ; Q_H * K_H^T -> S
+           flags=TRANSPOSE_B  imm=0x0701                            ; shift=7 for K=16
+BARRIER
+SOFTMAX    dst=0xCC00  src0=0xCB00                 M=S  N=S         ; softmax(S) -> P
+           flags=CAUSAL_MASK
+BARRIER
+GEMM       dst=0xCD00  src0=0xCC00  src1=0xCA00   M=S  N=16 K=S   ; P * V_H -> ATTN_H
+           imm=0x0701                                                ; shift=7 for K=S
+BARRIER
+VEC        dst=0xCE00  src0=0xCD00  M=S  K=16  imm=64              ; COPY2D: scatter ATTN_H
+           flags=VEC_COPY2D  N=16                                    ; -> ATTN[:, 0:16]
 
 BARRIER
 
-; --- Causal Softmax ---
-SOFTMAX    dst=0xD500  src0=0xD400                 M=S  N=S         ; softmax(S) -> P
-                                                   flags=CAUSAL_MASK
+; Head 1: Wq_h1 @ 0x0400, Wk_h1 @ 0x1400, Wv_h1 @ 0x2400
+;   (same pattern, dst_base=ATTN+16 for COPY2D scatter)
+; Head 2: Wq_h2 @ 0x0800, Wk_h2 @ 0x1800, Wv_h2 @ 0x2800
+; Head 3: Wq_h3 @ 0x0C00, Wk_h3 @ 0x1C00, Wv_h3 @ 0x2C00
 
-BARRIER
-
-; --- Attention Context ---
-GEMM       dst=0xD600  src0=0xD500  src1=0xD000   M=S  N=64  K=S   ; P * V -> ATTN
-
-BARRIER
+; ... (heads 1-3 follow identical pattern with offset weight/scatter addresses) ...
 
 ; --- Output Projection ---
-GEMM       dst=0xDA00  src0=0xD600  src1=0x3000   M=S  N=64  K=64  ; ATTN * Wo -> WO_OUT
+GEMM       dst=0xD200  src0=0xCE00  src1=0x3000   M=S  N=64 K=64  ; ATTN * Wo -> WO_OUT
 
 BARRIER
 
 ; --- First Residual Add ---
-VEC        dst=0xDE00  src0=0xDA00  src1=0x0100   M=S  N=64        ; WO_OUT + X -> X2
+VEC        dst=0xD600  src0=0xD200  src1=0x0100   M=S  N=64        ; WO_OUT + X -> X2
            flags=VEC_ADD                                             ; (X from SRAM1 residual)
 
 BARRIER
 
 ; --- Pre-FFN LayerNorm ---
-LAYERNORM  dst=0xE200  src0=0xDE00  src1=0x0040   M=S  N=64       ; LN2(X2) -> LN2_OUT
+LAYERNORM  dst=0xDA00  src0=0xD600  src1=0x0040   M=S  N=64       ; LN2(X2) -> LN2_OUT
 
 BARRIER
 
 ; --- FFN Up-Project ---
-GEMM       dst=0xE600  src0=0xE200  src1=0x4000   M=S  N=256 K=64  ; LN2_OUT * W1 -> FFN1
+GEMM       dst=0xDE00  src0=0xDA00  src1=0x4000   M=S  N=256 K=64  ; LN2_OUT * W1 -> FFN1
 
 BARRIER
 
 ; --- GELU Activation ---
-GELU       dst=0xE600  src0=0xE600                 M=S  N=256       ; gelu(FFN1) -> FFN1
+GELU       dst=0xDE00  src0=0xDE00                 M=S  N=256       ; gelu(FFN1) -> FFN1
                                                                      ; (in-place)
 
 BARRIER
 
 ; --- FFN Down-Project ---
-GEMM       dst=0xF600  src0=0xE600  src1=0x8000   M=S  N=64  K=256 ; FFN1 * W2 -> FFN2
+GEMM       dst=0xEE00  src0=0xDE00  src1=0x8000   M=S  N=64  K=256 ; FFN1 * W2 -> FFN2
 
 BARRIER
 
 ; --- Second Residual Add ---
-VEC        dst=0xFA00  src0=0xF600  src1=0x0100   M=S  N=64        ; FFN2 + X2 -> X_OUT
+VEC        dst=0xF200  src0=0xEE00  src1=0x0100   M=S  N=64        ; FFN2 + X2 -> X_OUT
            flags=VEC_ADD
 
 END
 ```
 
-This sequence executes 8 GEMM operations, 2 LayerNorms, 1 Softmax, 1 GELU, and 2 residual adds. The C++ testbench generates this microcode programmatically based on the current sequence length and model dimensions, and feeds it to the RTL.
+This sequence executes 23 GEMM operations (5 per head x 4 + Wo + FFN1 + FFN2), 2 LayerNorms, 4 Softmax, 1 GELU, 4 COPY2D scatters, and 2 residual adds (~113 instructions total). The C++ testbench generates this microcode programmatically based on the current sequence length and model dimensions, and feeds it to the RTL.
 
 ### KV-Cache Decode
 
@@ -435,24 +449,27 @@ KV-caching splits inference into two phases:
 **Prefill Phase** (runs once for the initial prompt):
 ```
 For each layer:
-  1. Run full transformer block (same as above)
-  2. After computing K and V, execute KV_APPEND to store them:
-     KV_APPEND  src=K_addr  M=layer  K=0  N=64    ; cache K[0..S-1]
-     KV_APPEND  src=V_addr  M=layer  K=0  N=64    ; cache V[0..S-1]
+  1. Run full transformer block with 4-head attention (same as above)
+  2. After computing K_H and V_H for each head, execute KV_APPEND:
+     For h = 0..3:
+       KV_APPEND  src=K_H  M=layer  K=0  N=16  imm=h  ; cache K_h[0..S-1]
+       KV_APPEND  src=V_H  M=layer  K=0  N=16  imm=h  ; cache V_h[0..S-1]
 ```
 
 **Decode Phase** (runs for each new token):
 ```
 For each layer:
-  1. Compute Q, K, V for ONLY the new token (M=1 instead of M=S)
-  2. Append new K, V to cache:
-     KV_APPEND  src=K_addr  M=layer  K=T  N=64    ; cache K[T]
-     KV_APPEND  src=V_addr  M=layer  K=T  N=64    ; cache V[T]
-  3. Read ALL cached K, V vectors back:
-     KV_READ    dst=K_addr  M=layer  K=T+1  N=64  ; read K[0..T]
-     KV_READ    dst=V_addr  M=layer  K=T+1  N=64  ; read V[0..T]
-  4. Compute attention: Q[1,64] * K[T+1,64]^T -> S[1,T+1]
-  5. Softmax, context multiply, output projection, FFN (all with M=1)
+  For h = 0..3:
+    1. Compute Q_H, K_H, V_H for ONLY the new token (M=1, N=16)
+    2. Append new K_H, V_H to per-head cache:
+       KV_APPEND  src=K_H  M=layer  K=T  N=16  imm=h  ; cache K_h[T]
+       KV_APPEND  src=V_H  M=layer  K=T  N=16  imm=h  ; cache V_h[T]
+    3. Read ALL cached K_H, V_H vectors for this head:
+       KV_READ    dst=K_cache  M=layer  K=T+1  N=16  imm=h  ; read K_h[0..T]
+       KV_READ    dst=V_cache  M=layer  K=T+1  N=16  imm=h  ; read V_h[0..T]
+    4. Compute attention: Q_H[1,16] * K_cache[T+1,16]^T -> S[1,T+1]
+    5. Softmax, context, COPY2D scatter into ATTN concat
+  Output projection, residual, LN2, FFN (all with M=1)
 ```
 
 The decode phase computes O(S) per step instead of O(S^2), yielding significant speedup:
@@ -478,11 +495,12 @@ tiny-npu runs real GPT-2 inference, not a toy example. Here's what happens end-t
 |-----------|-------|-------|
 | Hidden dimension | 64 | First 64 of GPT-2's 768 |
 | Layers | 4 | First 4 of 12 |
-| Attention heads | 1 | Single-head (head_dim = hidden) |
+| Attention heads | 4 | 4 heads x 16 head_dim = 64 hidden |
+| Head dimension | 16 | Heads processed sequentially, buffers reused |
 | FFN dimension | 256 | 4x hidden |
 | Vocabulary | 256 | Byte-level (first 256 GPT-2 tokens) |
 | Max sequence | 16 | Fits in 64KB SRAM with all weights |
-| Quantization | INT8 | Per-tensor symmetric, shift=9 |
+| Quantization | INT8 | Per-tensor symmetric, shift=9 (K=64), shift=7 (K=16) |
 
 ### Pipeline
 
@@ -542,8 +560,8 @@ This builds 6 simulation targets:
 |---|--------|-------------|
 | 1 | `npu_sim` | Control plane smoke test (AXI registers, reset) |
 | 2 | `engine_sim` | Individual engine compute tests (6 tests) |
-| 3 | `integration_sim` | Single attention head integration |
-| 4 | `gpt2_block_sim` | Full transformer block (8 HW GEMMs verified) |
+| 3 | `integration_sim` | Attention head integration |
+| 4 | `gpt2_block_sim` | Full transformer block (23 HW GEMMs, 4-head attention) |
 | 5 | `demo_infer` | End-to-end GPT-2 inference demo |
 | 6 | `kv_cache_sim` | KV cache correctness (bit-exact vs full-recompute) |
 
@@ -557,7 +575,7 @@ cd npu/sim/verilator/build
 ./npu_sim             # Control plane smoke test
 ./engine_sim          # Engine compute tests (GEMM, Softmax, LN, GELU, Vec, DMA)
 ./integration_sim     # Attention head integration
-./gpt2_block_sim      # Full transformer block (8 HW GEMMs)
+./gpt2_block_sim      # Full transformer block (23 HW GEMMs, 4-head)
 ```
 
 ### Run GPT-2 Inference Demo
@@ -658,13 +676,6 @@ gtkwave demo_infer.vcd &
 
 For the sake of clarity and learnability, tiny-npu omits many optimizations found in production NPUs. Here are some of the most important ones:
 
-### Multi-Head Attention
-
-tiny-npu uses single-head attention (head_dim = hidden_dim = 64). Production transformers split the hidden dimension across multiple attention heads (e.g., GPT-2 uses 12 heads of 64 dims each). This requires either:
-- Sequential per-head computation with SRAM swapping
-- Parallel head computation with wider datapaths
-- Fused multi-head attention hardware
-
 ### Floating Point / Mixed Precision
 
 tiny-npu uses pure INT8 computation with INT32 accumulators. Production NPUs typically use:
@@ -704,7 +715,6 @@ Improvements I want to make to the design:
 
 - [ ] Integrate hardware KV cache (`kv_cache_bank.sv`) into the datapath
 - [ ] Add double buffering for weight loading (DMA + compute overlap)
-- [ ] Multi-head attention support (4 heads x 16 dims)
 - [ ] Scale to full GPT-2 dimensions (hidden=768) with weight streaming
 - [ ] Add FP16 accumulation mode for better dynamic range
 - [ ] FPGA synthesis and on-board demo (Xilinx Zynq / Artix-7)
