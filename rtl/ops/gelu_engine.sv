@@ -16,6 +16,7 @@ module gelu_engine (
     input  logic [15:0]        length,       // number of elements
     input  logic [15:0]        src_base,     // SRAM read base address
     input  logic [15:0]        dst_base,     // SRAM write base address
+    input  logic               silu_mode,    // 1 = SiLU LUT, 0 = GELU LUT
 
     // SRAM read port
     output logic               sram_rd_en,
@@ -53,22 +54,34 @@ module gelu_engine (
     logic [15:0] r_idx;
 
     // ----------------------------------------------------------------
-    // GELU LUT signals
+    // LUT signals
     // ----------------------------------------------------------------
     logic [7:0]  lut_addr;
     logic [7:0]  lut_data;
+    logic [7:0]  gelu_lut_out;
+    logic [7:0]  silu_lut_out;
+    logic        r_silu_mode;
 
     // Pipeline register
     logic [7:0]  p_rd_data;
 
     // ----------------------------------------------------------------
-    // GELU LUT instantiation
+    // GELU and SiLU LUT instantiations
     // ----------------------------------------------------------------
     gelu_lut u_gelu_lut (
         .clk      (clk),
         .addr     (lut_addr),
-        .data_out (lut_data)
+        .data_out (gelu_lut_out)
     );
+
+    silu_lut u_silu_lut (
+        .clk      (clk),
+        .addr     (lut_addr),
+        .data_out (silu_lut_out)
+    );
+
+    // Mux LUT output based on SiLU mode
+    assign lut_data = r_silu_mode ? silu_lut_out : gelu_lut_out;
 
     // ----------------------------------------------------------------
     // FSM transition
@@ -100,13 +113,15 @@ module gelu_engine (
     // ----------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            r_length   <= '0;
-            r_src_base <= '0;
-            r_dst_base <= '0;
+            r_length    <= '0;
+            r_src_base  <= '0;
+            r_dst_base  <= '0;
+            r_silu_mode <= '0;
         end else if (state == S_IDLE && cmd_valid) begin
-            r_length   <= length;
-            r_src_base <= src_base;
-            r_dst_base <= dst_base;
+            r_length    <= length;
+            r_src_base  <= src_base;
+            r_dst_base  <= dst_base;
+            r_silu_mode <= silu_mode;
         end
     end
 

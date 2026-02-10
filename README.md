@@ -2,7 +2,7 @@
 
 A minimal transformer inference accelerator in SystemVerilog, optimized for learning how NPUs (Neural Processing Units) work from the ground up.
 
-Built with fully documented SystemVerilog RTL, a complete 128-bit microcode ISA, working GPT-2 inference running on real HuggingFace weights, KV-cache optimization, and full Verilator simulation with cycle-accurate verification.
+Built with fully documented SystemVerilog RTL, a complete 128-bit microcode ISA, working GPT-2 and LLaMA inference running on real HuggingFace weights, KV-cache optimization, and full Verilator simulation with cycle-accurate verification.
 
 ### Table of Contents
 
@@ -49,7 +49,7 @@ With this motivation in mind, we can strip away the complexity of production-gra
 4. **Memory Management** - How do you fit weights, activations, and intermediate results in limited on-chip SRAM?
 5. **KV-Cache Optimization** - How does caching key/value vectors make autoregressive decoding faster?
 
-The result: a chip that loads real GPT-2 weights from HuggingFace, runs INT8 quantized inference through 4 transformer layers with 4-head attention, and generates text - all verified cycle-accurate against a Python golden model.
+The result: a chip that loads real GPT-2 and LLaMA weights from HuggingFace, runs INT8 quantized inference through 4 transformer layers with multi-head attention (MHA for GPT-2, GQA for LLaMA), and generates tokens - all verified cycle-accurate against Python and C++ golden models.
 
 # Architecture
 
@@ -73,12 +73,11 @@ The result: a chip that loads real GPT-2 weights from HuggingFace, runs INT8 qua
     +--------------+ | Array   | | | based   |
                      | 256 MACs| | +---------+
                      +---------+ |
-                         +-------v-------+  +----------+
-                         |  LayerNorm    |  |   GELU   |
-                         |  Engine       |  |  Engine  |
-                         |  (mean+var+   |  | (LUT-    |
-                         |   normalize)  |  |  based)  |
-                         +---------------+  +----------+
+                         +-------v-------+  +----------+  +----------+
+                         |  LayerNorm /  |  |   GELU / |  |   RoPE   |
+                         |  RMSNorm     |  |   SiLU   |  |  Engine  |
+                         |  Engines      |  |  Engines |  | (rotate) |
+                         +---------------+  +----------+  +----------+
                                   |
                     +-------------v--------------+
                     |     On-Chip SRAM Banks      |
@@ -502,6 +501,28 @@ tiny-npu runs real GPT-2 inference, not a toy example. Here's what happens end-t
 | Max sequence | 16 | Fits in 64KB SRAM with all weights |
 | Quantization | INT8 | Per-tensor symmetric, shift=9 (K=64), shift=7 (K=16) |
 
+### LLaMA Model Configuration
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Hidden dimension | 64 | First 64 of MicroLlama's 1024 |
+| Layers | 4 | First 4 of MicroLlama's 22 |
+| Q attention heads | 4 | 4 heads x 16 head_dim = 64 hidden |
+| KV attention heads | 2 | Grouped-Query Attention (GQA ratio = 2) |
+| Head dimension | 16 | With RoPE positional encoding |
+| FFN dimension | 128 | SwiGLU (gate + up + down projections) |
+| Vocabulary | 256 | Byte-level (first 256 LLaMA tokens) |
+| Max sequence | 16 | Fits in 64KB SRAM with all weights |
+| Quantization | INT8 | Per-tensor symmetric, shift=2 (K=64), shift=7 (K=16), shift=2 (K=128) |
+
+#### LLaMA-Specific Hardware
+
+The LLaMA pipeline adds three new engines beyond GPT-2:
+
+- **RMSNorm Engine** - Two-pass RMSNorm: Pass 1 accumulates sum(x^2) with signed squaring and computes inv_rms via rsqrt LUT. Pass 2 applies fused `(x * gamma) * inv_rms >> 16` to preserve full dynamic range.
+- **RoPE Engine** - Rotary positional encoding applied to Q and K projections. Uses precomputed sin/cos tables in Q1.7 format. Operates on pairs of elements within each head dimension.
+- **SiLU Engine** - SiLU (Swish) activation via 256-entry LUT, used in the SwiGLU FFN gate path.
+
 ### Pipeline
 
 ```
@@ -542,7 +563,7 @@ sudo apt update
 sudo apt install -y build-essential cmake python3 python3-pip verilator
 
 # Python dependencies (only needed for inference demo)
-pip3 install numpy transformers
+pip3 install numpy transformers huggingface_hub safetensors
 ```
 
 ### Build
@@ -554,7 +575,7 @@ cmake ..
 cmake --build . -j$(nproc)
 ```
 
-This builds 6 simulation targets:
+This builds 8 simulation targets:
 
 | # | Target | Description |
 |---|--------|-------------|
@@ -564,6 +585,8 @@ This builds 6 simulation targets:
 | 4 | `gpt2_block_sim` | Full transformer block (23 HW GEMMs, 4-head attention) |
 | 5 | `demo_infer` | End-to-end GPT-2 inference demo |
 | 6 | `kv_cache_sim` | KV cache correctness (bit-exact vs full-recompute) |
+| 7 | `llama_block_sim` | Full LLaMA transformer block (GQA, RoPE, SwiGLU) |
+| 8 | `llama_demo_infer` | End-to-end LLaMA inference demo |
 
 ### Run Unit Tests
 
@@ -626,6 +649,42 @@ cmake --build . --target demo_infer -j$(nproc)
 # KV-cache mode
 ./demo_infer --datadir demo_data --max-tokens 10 --temperature 0.8 --seed 42 --kv-cache
 ```
+
+### Run LLaMA Inference Demo
+
+The LLaMA demo supports both random weights and real MicroLlama weights from HuggingFace.
+
+**Random weights** (no dependencies beyond numpy):
+
+```bash
+cd npu/python/tools
+python3 llama_gen_weights.py --outdir ../../sim/verilator/build/llama_demo_data
+
+cd ../../sim/verilator/build
+./llama_demo_infer --datadir llama_demo_data
+```
+
+**HuggingFace MicroLlama weights** (requires `huggingface_hub`, `safetensors`):
+
+```bash
+cd npu/python/tools
+python3 llama_gen_weights_hf.py --outdir ../../sim/verilator/build/llama_demo_data_hf
+
+cd ../../sim/verilator/build
+./llama_demo_infer --datadir llama_demo_data_hf
+```
+
+Expected output:
+```
+  Step  0: npu_tok=160 gold_tok=160 logit_max_err=0 EXACT
+  Step  1: npu_tok=172 gold_tok=172 logit_max_err=0 EXACT
+  Step  2: npu_tok=  2 gold_tok=  2 logit_max_err=0 EXACT
+  Step  3: npu_tok=141 gold_tok=141 logit_max_err=0 EXACT
+
+  LLAMA DEMO: PASS
+```
+
+The NPU hardware produces **bit-exact** logits compared to the C++ golden model (`logit_max_err=0`).
 
 ### Run KV Cache Correctness Test
 
@@ -718,7 +777,7 @@ Improvements I want to make to the design:
 - [ ] Scale to full GPT-2 dimensions (hidden=768) with weight streaming
 - [ ] Add FP16 accumulation mode for better dynamic range
 - [ ] FPGA synthesis and on-board demo (Xilinx Zynq / Artix-7)
-- [ ] Support for more model architectures (LLaMA-style RoPE, GQA)
+- [x] Support for more model architectures (LLaMA-style RoPE, GQA)
 
 # Repository Structure
 
@@ -756,6 +815,9 @@ npu/
       softmax_engine.sv        3-pass softmax (max, exp+sum, normalize)
       layernorm_engine.sv      LayerNorm (mean, variance, normalize)
       gelu_engine.sv           GELU activation via LUT
+      rmsnorm_engine.sv        RMSNorm (2-pass, fused x*gamma*inv_rms)
+      rope_engine.sv           Rotary positional encoding
+      silu_lut.sv              SiLU activation via LUT
       vec_engine.sv            Vector elementwise operations
       exp_lut.sv               Exponential lookup table
       recip_lut.sv             Reciprocal lookup table
@@ -767,15 +829,18 @@ npu/
   sim/
     verilator/               Verilator simulation environment
       CMakeLists.txt           Build system (6 targets)
-      gpt2_block_top.sv        Testbench top (SRAMs + ucode + engines)
+      gpt2_block_top.sv        GPT-2 testbench top (SRAMs + ucode + engines)
+      llama_block_top.sv       LLaMA testbench top (SRAMs + ucode + engines)
       engine_tb_top.sv         Engine-level testbench wrapper
       integration_top.sv       Integration testbench wrapper
       tb_top.cpp               Target 1: Control plane smoke test
       tb_engines.cpp           Target 2: Engine compute tests
       tb_integration.cpp       Target 3: Attention head integration
-      tb_gpt2_block.cpp        Target 4: Full transformer block test
+      tb_gpt2_block.cpp        Target 4: Full GPT-2 transformer block test
       tb_demo_infer.cpp        Target 5: GPT-2 inference demo
       tb_kv_cache_sim.cpp      Target 6: KV cache correctness test
+      tb_llama_block.cpp       Target 7: Full LLaMA transformer block test
+      tb_llama_demo_infer.cpp  Target 8: LLaMA inference demo
       run_demo.sh              Automated demo runner script
   python/
     golden/                  Python golden reference models
@@ -783,15 +848,22 @@ npu/
       softmax_ref.py           Fixed-point softmax with LUT
       layernorm_ref.py         Fixed-point LayerNorm
       gelu_ref.py              GELU via LUT
+      rmsnorm_ref.py           RMSNorm (fused fixed-point)
+      rope_ref.py              Rotary positional encoding
+      silu_ref.py              SiLU activation via LUT
+      llama_infer_golden.py    LLaMA multi-step inference golden
       quant.py                 Quantization utilities
       attention_head_ref.py    Full attention head golden
       gpt2_block_ref.py        Full transformer block golden
       gpt2_infer_golden.py     Multi-step inference golden
     tools/                   Build and debug tools
-      ddr_map.py               Model config, SRAM layout, weight offsets
+      ddr_map.py               GPT-2 model config, SRAM layout, weight offsets
+      llama_map.py             LLaMA model config, SRAM layout, quant params
       kv_map.py                KV cache constants, decode-mode addresses
       export_gpt2_weights.py   Export weights from HuggingFace GPT-2
       quantize_pack.py         INT8 quantization + weights.bin packing
+      llama_gen_weights.py     Generate random LLaMA weights + golden
+      llama_gen_weights_hf.py  Generate LLaMA weights from HuggingFace MicroLlama
       make_lut.py              LUT initialization file generator
       ucode_asm.py             Microcode assembler
     tests/

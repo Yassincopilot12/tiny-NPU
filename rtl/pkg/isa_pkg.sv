@@ -23,6 +23,9 @@ package isa_pkg;
         OP_KV_APPEND  = 8'd8,
         OP_KV_READ    = 8'd9,
         OP_BARRIER    = 8'd10,
+        OP_RMSNORM    = 8'd11,
+        OP_ROPE       = 8'd12,
+        OP_SILU       = 8'd13,
         OP_END        = 8'd255
     } opcode_t;
 

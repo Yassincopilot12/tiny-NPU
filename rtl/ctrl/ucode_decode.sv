@@ -21,7 +21,7 @@ module ucode_decode
     output logic                instr_ready,
 
     // --- From scoreboard ---
-    input  logic [5:0]          can_issue,      // one bit per engine
+    input  logic [7:0]          can_issue,      // one bit per engine
     input  logic                all_idle,        // all engines done (for barrier)
 
     // --- GEMM engine command ---
@@ -86,6 +86,26 @@ module ucode_decode
     output logic [15:0]         kv_cmd_len,
     output logic [7:0]          kv_cmd_flags,
     output logic [15:0]         kv_cmd_imm,
+
+    // --- RMSNorm engine command ---
+    output logic                rmsnorm_cmd_valid,
+    output logic [15:0]         rmsnorm_cmd_src0,
+    output logic [15:0]         rmsnorm_cmd_dst,
+    output logic [15:0]         rmsnorm_cmd_len,
+    output logic [15:0]         rmsnorm_cmd_gamma,
+
+    // --- RoPE engine command ---
+    output logic                rope_cmd_valid,
+    output logic [15:0]         rope_cmd_src0,
+    output logic [15:0]         rope_cmd_dst,
+    output logic [15:0]         rope_cmd_num_rows,
+    output logic [15:0]         rope_cmd_head_dim,
+    output logic [15:0]         rope_cmd_pos_offset,
+    output logic [15:0]         rope_cmd_sin_base,
+    output logic [15:0]         rope_cmd_cos_base,
+
+    // --- SiLU mode flag for GELU engine ---
+    output logic                silu_mode,
 
     // --- Barrier ---
     output logic                barrier_trigger,
@@ -192,6 +212,18 @@ module ucode_decode
             end
             OP_KV_READ: begin
                 target_engine = ENG_DMA;
+                target_valid  = 1'b1;
+            end
+            OP_RMSNORM: begin
+                target_engine = ENG_RMSNORM;
+                target_valid  = 1'b1;
+            end
+            OP_ROPE: begin
+                target_engine = ENG_ROPE;
+                target_valid  = 1'b1;
+            end
+            OP_SILU: begin
+                target_engine = ENG_GELU;   // shares GELU engine
                 target_valid  = 1'b1;
             end
             OP_BARRIER: begin
@@ -393,12 +425,13 @@ module ucode_decode
     assign layernorm_cmd_len   = cmd_n_q;
     assign layernorm_cmd_flags = cmd_flags_q;
 
-    // -- GELU --
-    assign gelu_cmd_valid = cmd_valid_q && (cmd_opcode_q == OP_GELU);
+    // -- GELU / SiLU (shared engine) --
+    assign gelu_cmd_valid = cmd_valid_q && ((cmd_opcode_q == OP_GELU) || (cmd_opcode_q == OP_SILU));
     assign gelu_cmd_src0  = cmd_src0_q;
     assign gelu_cmd_dst   = cmd_dst_q;
     assign gelu_cmd_len   = cmd_n_q;
     assign gelu_cmd_flags = cmd_flags_q;
+    assign silu_mode      = cmd_valid_q && (cmd_opcode_q == OP_SILU);
 
     // -- Vec --
     assign vec_cmd_valid = cmd_valid_q && (cmd_opcode_q == OP_VEC);
@@ -442,6 +475,23 @@ module ucode_decode
 
     // -- Program end --
     assign program_end = program_end_q;
+
+    // -- RMSNorm --
+    assign rmsnorm_cmd_valid = cmd_valid_q && (cmd_opcode_q == OP_RMSNORM);
+    assign rmsnorm_cmd_src0  = cmd_src0_q;
+    assign rmsnorm_cmd_dst   = cmd_dst_q;
+    assign rmsnorm_cmd_len   = cmd_n_q;     // N = hidden dimension
+    assign rmsnorm_cmd_gamma = cmd_src1_q;  // src1 = gamma base in SRAM1
+
+    // -- RoPE --
+    assign rope_cmd_valid      = cmd_valid_q && (cmd_opcode_q == OP_ROPE);
+    assign rope_cmd_src0       = cmd_src0_q;         // SRAM0 Q/K base
+    assign rope_cmd_dst        = cmd_dst_q;          // SRAM0 output base
+    assign rope_cmd_num_rows   = cmd_m_q;            // M = sequence length
+    assign rope_cmd_head_dim   = cmd_n_q;            // N = head_dim
+    assign rope_cmd_pos_offset = cmd_k_q;            // K = pos_offset
+    assign rope_cmd_sin_base   = cmd_src1_q;         // src1 = sin table base in SRAM1
+    assign rope_cmd_cos_base   = cmd_imm_q;          // imm = cos table base in SRAM1
 
     // -- Decoded instruction struct (for debug / downstream consumers) --
     always_comb begin

@@ -319,6 +319,7 @@ module engine_tb_top
         .rst_n         (rst_n),
         .cmd_valid     (gelu_cmd_valid),
         .cmd_ready     (),
+        .silu_mode     (1'b0),
         .length        (gelu_length),
         .src_base      (gelu_src_base),
         .dst_base      (gelu_dst_base),

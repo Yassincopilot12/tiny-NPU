@@ -46,6 +46,11 @@ package npu_pkg;
     parameter int TINY_SEQ_LEN  = 8;
     parameter int TINY_LAYERS   = 1;
 
+    // Tiny LLaMA config
+    parameter int TINY_KV_HEADS    = 2;
+    parameter int TINY_LLAMA_FFN   = 128;
+    parameter int TINY_LLAMA_LAYERS = 4;
+
     // GPT-2 Small config (for documentation / parameterization):
     // HIDDEN=768, HEADS=12, HEAD_DIM=64, FFN=3072, LAYERS=12, VOCAB=50257
 
@@ -60,7 +65,9 @@ package npu_pkg;
         ENG_LAYERNORM = 3'd2,
         ENG_GELU      = 3'd3,
         ENG_VEC       = 3'd4,
-        ENG_DMA       = 3'd5
+        ENG_DMA       = 3'd5,
+        ENG_RMSNORM   = 3'd6,
+        ENG_ROPE      = 3'd7
     } engine_id_t;
 
     // =========================================================================

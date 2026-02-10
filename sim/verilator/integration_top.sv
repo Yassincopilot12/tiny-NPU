@@ -208,8 +208,8 @@ module integration_top
         .instr_valid        (fetch_instr_valid),
         .instr_data         (fetch_instr_data),
         .instr_ready        (fetch_instr_ready),
-        // From scoreboard
-        .can_issue          (can_issue_vec),
+        // From scoreboard (pad to 8 bits: engines 6,7 not present)
+        .can_issue          ({2'b11, can_issue_vec}),
         .all_idle           (all_idle),
         // GEMM
         .gemm_cmd_valid     (gemm_cmd_valid_dec),
@@ -265,6 +265,23 @@ module integration_top
         .kv_cmd_len         (kv_cmd_len_dec),
         .kv_cmd_flags       (kv_cmd_flags_dec),
         .kv_cmd_imm         (kv_cmd_imm_dec),
+        // RMSNorm (unused in integration top)
+        .rmsnorm_cmd_valid  (),
+        .rmsnorm_cmd_src0   (),
+        .rmsnorm_cmd_dst    (),
+        .rmsnorm_cmd_len    (),
+        .rmsnorm_cmd_gamma  (),
+        // RoPE (unused in integration top)
+        .rope_cmd_valid     (),
+        .rope_cmd_src0      (),
+        .rope_cmd_dst       (),
+        .rope_cmd_num_rows  (),
+        .rope_cmd_head_dim  (),
+        .rope_cmd_pos_offset(),
+        .rope_cmd_sin_base  (),
+        .rope_cmd_cos_base  (),
+        // SiLU mode (unused in integration top)
+        .silu_mode          (),
         // Barrier
         .barrier_trigger    (barrier_trigger),
         // Scoreboard

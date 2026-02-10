@@ -1,16 +1,16 @@
 // =============================================================================
-// gpt2_block_top.sv - Integration wrapper for full GPT-2 transformer block
-// Wires control plane (fetch/decode/scoreboard/barrier) to real engines:
-//   softmax, layernorm, gelu, vec, GEMM (HW tiled for all dimensions)
-// Plus DMA shim that exposes commands to C++.
+// llama_block_top.sv - Integration wrapper for LLaMA transformer block
+// Wires control plane (fetch/decode/scoreboard/barrier) to 8 engines:
+//   GEMM, softmax, layernorm, gelu+silu, vec, DMA shim, rmsnorm, rope
+// Supports GQA attention with RoPE and SwiGLU FFN.
 // =============================================================================
 `default_nettype none
 
-module gpt2_block_top
+module llama_block_top
     import npu_pkg::*;
     import isa_pkg::*;
 #(
-    parameter int SRAM0_DEPTH   = 8192,
+    parameter int SRAM0_DEPTH   = 65536,
     parameter int SRAM1_DEPTH   = 4096,
     parameter int SCRATCH_DEPTH = 4096,
     parameter int UCODE_DEPTH_P = 1024,
@@ -61,30 +61,28 @@ module gpt2_block_top
     output wire  [7:0]         kv_opcode_out,
     output wire  [15:0]        kv_src_out,
     output wire  [15:0]        kv_dst_out,
-    output wire  [15:0]        kv_m_out,       // layer_id
-    output wire  [15:0]        kv_n_out,       // vector_length
-    output wire  [15:0]        kv_k_out,       // time_index or time_len
+    output wire  [15:0]        kv_m_out,
+    output wire  [15:0]        kv_n_out,
+    output wire  [15:0]        kv_k_out,
     output wire  [7:0]         kv_flags_out,
-    output wire  [15:0]        kv_imm_out,     // head_id
+    output wire  [15:0]        kv_imm_out,
     input  wire                kv_done_pulse,
 
     // --- Debug ---
     output wire  [7:0]         engine_busy_dbg,
     output wire                all_idle_dbg,
-    output wire                softmax_busy_dbg,
+    output wire  [4:0]         hw_gemm_done_count,
     output wire                softmax_done_dbg,
-    output wire                layernorm_busy_dbg,
     output wire                layernorm_done_dbg,
-    output wire                gelu_busy_dbg,
     output wire                gelu_done_dbg,
     output wire                vec_busy_dbg,
     output wire                vec_done_dbg,
-    output wire  [4:0]         hw_gemm_done_count
+    output wire                rmsnorm_done_dbg,
+    output wire                rope_done_dbg
 );
 
     // ================================================================
     // UCODE SRAM (128-bit x UCODE_DEPTH_P)
-    // Port A: fetch reads, Port B: TB writes
     // ================================================================
     logic                   uc_rd_en;
     logic [UC_ADDR_W-1:0]  uc_rd_addr;
@@ -145,7 +143,7 @@ module gpt2_block_top
     );
 
     // ================================================================
-    // Scoreboard
+    // Scoreboard (8 engines)
     // ================================================================
     logic [7:0]  engine_done_vec;
     logic [7:0]  engine_busy_vec;
@@ -219,18 +217,18 @@ module gpt2_block_top
     logic [15:0] kv_cmd_src0_dec, kv_cmd_dst_dec, kv_cmd_len_dec, kv_cmd_imm_dec;
     logic [7:0]  kv_cmd_flags_dec;
 
-    // RMSNorm decode outputs (unused in GPT-2 block)
+    // RMSNorm decode outputs
     logic        rmsnorm_cmd_valid_dec;
     logic [15:0] rmsnorm_cmd_src0_dec, rmsnorm_cmd_dst_dec, rmsnorm_cmd_len_dec;
     logic [15:0] rmsnorm_cmd_gamma_dec;
 
-    // RoPE decode outputs (unused in GPT-2 block)
+    // RoPE decode outputs
     logic        rope_cmd_valid_dec;
     logic [15:0] rope_cmd_src0_dec, rope_cmd_dst_dec;
     logic [15:0] rope_cmd_num_rows_dec, rope_cmd_head_dim_dec;
     logic [15:0] rope_cmd_pos_offset_dec, rope_cmd_sin_base_dec, rope_cmd_cos_base_dec;
 
-    // SiLU mode (unused in GPT-2 block, always 0)
+    // SiLU mode
     logic        silu_mode_dec;
 
     logic        program_end_dec;
@@ -314,7 +312,6 @@ module gpt2_block_top
 
     // ================================================================
     // Real GEMM Engine: gemm_ctrl + systolic_array
-    // All GEMM commands go directly to HW (tiled internally)
     // ================================================================
     logic        gm_busy, gm_done;
     logic        gm_rd_en, gm_wr_en;
@@ -325,7 +322,6 @@ module gpt2_block_top
     logic signed [7:0]  gm_sa_b_row [16];
     logic signed [31:0] gm_sa_acc   [16][16];
 
-    // ACC SRAM interface signals
     logic        gm_acc_rd_en, gm_acc_wr_en;
     logic [7:0]  gm_acc_rd_addr, gm_acc_wr_addr;
     logic signed [31:0] gm_acc_rd_data, gm_acc_wr_data;
@@ -386,8 +382,7 @@ module gpt2_block_top
     );
 
     // ================================================================
-    // ACC SRAM (32-bit x 256 entries) - K-tiling accumulation buffer
-    // Port A: read, Port B: write
+    // ACC SRAM (32-bit x 256 entries)
     // ================================================================
     sram_dp #(.DEPTH(256), .WIDTH(32)) u_acc_sram (
         .clk    (clk),
@@ -416,7 +411,7 @@ module gpt2_block_top
     assign hw_gemm_done_count = hw_gemm_cnt;
 
     // ================================================================
-    // DMA Shim: capture command, hold busy, let C++ handle
+    // DMA Shim
     // ================================================================
     logic        dma_active;
     logic [15:0] dma_src_r, dma_dst_r, dma_len_r;
@@ -424,7 +419,6 @@ module gpt2_block_top
     logic        dma_captured_r;
     logic        dma_done_internal;
 
-    // KV Cache Shim: capture KV_APPEND/KV_READ commands
     logic        kv_active;
     logic [7:0]  kv_opcode_r;
     logic [15:0] kv_src_r, kv_dst_r, kv_m_r, kv_n_r, kv_k_r, kv_imm_r;
@@ -454,7 +448,6 @@ module gpt2_block_top
             dma_captured_r <= 1'b0;
             kv_captured_r  <= 1'b0;
 
-            // DMA capture (guard: neither DMA nor KV already active)
             if ((dma_rd_cmd_valid_dec || dma_wr_cmd_valid_dec) && !dma_active && !kv_active) begin
                 dma_active     <= 1'b1;
                 dma_captured_r <= 1'b1;
@@ -466,7 +459,6 @@ module gpt2_block_top
                 dma_active <= 1'b0;
             end
 
-            // KV capture (guard: neither DMA nor KV already active)
             if (kv_cmd_valid_dec && !kv_active && !dma_active) begin
                 kv_active     <= 1'b1;
                 kv_captured_r <= 1'b1;
@@ -530,7 +522,7 @@ module gpt2_block_top
     logic [15:0] ln_wr_addr;
     logic [7:0]  ln_wr_data;
 
-    // GELU
+    // GELU/SiLU
     logic        ge_busy, ge_done;
     logic        ge_rd_en;
     logic [15:0] ge_rd_addr;
@@ -551,9 +543,32 @@ module gpt2_block_top
     logic [15:0] ve_wr_addr;
     logic [7:0]  ve_wr_data;
 
+    // RMSNorm
+    logic        rn_busy, rn_done;
+    logic        rn_rd0_en;
+    logic [15:0] rn_rd0_addr;
+    logic [7:0]  rn_rd0_data;
+    logic        rn_rd1_en;
+    logic [15:0] rn_rd1_addr;
+    logic [7:0]  rn_rd1_data;
+    logic        rn_wr_en;
+    logic [15:0] rn_wr_addr;
+    logic [7:0]  rn_wr_data;
+
+    // RoPE
+    logic        rp_busy, rp_done;
+    logic        rp_rd0_en;
+    logic [15:0] rp_rd0_addr;
+    logic [7:0]  rp_rd0_data;
+    logic        rp_rd1_en;
+    logic [15:0] rp_rd1_addr;
+    logic [7:0]  rp_rd1_data;
+    logic        rp_wr_en;
+    logic [15:0] rp_wr_addr;
+    logic [7:0]  rp_wr_data;
+
     // ================================================================
-    // DATA SRAM0 (8-bit x SRAM0_DEPTH) - main data and weights
-    // Port A: engine/TB reads, Port B: engine/TB writes
+    // DATA SRAM0 (8-bit x SRAM0_DEPTH)
     // ================================================================
     logic                    s0_a_en;
     logic [SRAM0_AW-1:0]    s0_a_addr;
@@ -573,6 +588,12 @@ module gpt2_block_top
         end else if (ln_busy) begin
             s0_a_en   = ln_rd0_en;
             s0_a_addr = ln_rd0_addr[SRAM0_AW-1:0];
+        end else if (rn_busy) begin
+            s0_a_en   = rn_rd0_en;
+            s0_a_addr = rn_rd0_addr[SRAM0_AW-1:0];
+        end else if (rp_busy) begin
+            s0_a_en   = rp_rd0_en;
+            s0_a_addr = rp_rd0_addr[SRAM0_AW-1:0];
         end else if (ge_busy) begin
             s0_a_en   = ge_rd_en;
             s0_a_addr = ge_rd_addr[SRAM0_AW-1:0];
@@ -602,6 +623,16 @@ module gpt2_block_top
             s0_b_we   = ln_wr_en;
             s0_b_addr = ln_wr_addr[SRAM0_AW-1:0];
             s0_b_din  = ln_wr_data;
+        end else if (rn_busy) begin
+            s0_b_en   = rn_wr_en;
+            s0_b_we   = rn_wr_en;
+            s0_b_addr = rn_wr_addr[SRAM0_AW-1:0];
+            s0_b_din  = rn_wr_data;
+        end else if (rp_busy) begin
+            s0_b_en   = rp_wr_en;
+            s0_b_we   = rp_wr_en;
+            s0_b_addr = rp_wr_addr[SRAM0_AW-1:0];
+            s0_b_din  = rp_wr_data;
         end else if (ge_busy) begin
             s0_b_en   = ge_wr_en;
             s0_b_we   = ge_wr_en;
@@ -634,26 +665,33 @@ module gpt2_block_top
         .dout_b ()
     );
 
-    // Broadcast SRAM0 read data to all consumers
+    // Broadcast SRAM0 read data
     assign sm_rd_data       = s0_a_dout;
     assign ln_rd0_data      = s0_a_dout;
+    assign rn_rd0_data      = s0_a_dout;
+    assign rp_rd0_data      = s0_a_dout;
     assign ge_rd_data       = s0_a_dout;
     assign ve_rd0_data      = s0_a_dout;
     assign tb_sram0_rd_data = s0_a_dout;
 
     // ================================================================
-    // DATA SRAM1 (8-bit x SRAM1_DEPTH) - LN beta + residual copies
-    // Port A: engine/TB reads, Port B: TB writes
+    // DATA SRAM1 (8-bit x SRAM1_DEPTH)
     // ================================================================
     logic                    s1_a_en;
     logic [SRAM1_AW-1:0]    s1_a_addr;
     logic [7:0]              s1_a_dout;
 
-    // SRAM1 read mux (port A)
+    // SRAM1 read mux (port A) - add rmsnorm and rope
     always_comb begin
         if (ln_busy) begin
             s1_a_en   = ln_rd1_en;
             s1_a_addr = ln_rd1_addr[SRAM1_AW-1:0];
+        end else if (rn_busy) begin
+            s1_a_en   = rn_rd1_en;
+            s1_a_addr = rn_rd1_addr[SRAM1_AW-1:0];
+        end else if (rp_busy) begin
+            s1_a_en   = rp_rd1_en;
+            s1_a_addr = rp_rd1_addr[SRAM1_AW-1:0];
         end else if (ve_busy) begin
             s1_a_en   = ve_rd1_en;
             s1_a_addr = ve_rd1_addr[SRAM1_AW-1:0];
@@ -678,6 +716,8 @@ module gpt2_block_top
     );
 
     assign ln_rd1_data      = s1_a_dout;
+    assign rn_rd1_data      = s1_a_dout;
+    assign rp_rd1_data      = s1_a_dout;
     assign ve_rd1_data      = s1_a_dout;
     assign tb_sram1_rd_data = s1_a_dout;
 
@@ -699,7 +739,7 @@ module gpt2_block_top
     );
 
     // ================================================================
-    // Softmax Engine (real hardware)
+    // Softmax Engine
     // ================================================================
     softmax_engine u_softmax (
         .clk             (clk),
@@ -729,7 +769,7 @@ module gpt2_block_top
     );
 
     // ================================================================
-    // LayerNorm Engine (real hardware)
+    // LayerNorm Engine
     // ================================================================
     layernorm_engine u_layernorm (
         .clk             (clk),
@@ -755,7 +795,7 @@ module gpt2_block_top
     );
 
     // ================================================================
-    // GELU Engine (real hardware)
+    // GELU/SiLU Engine
     // ================================================================
     gelu_engine u_gelu (
         .clk             (clk),
@@ -765,7 +805,7 @@ module gpt2_block_top
         .length          (gelu_cmd_len_dec),
         .src_base        (gelu_cmd_src0_dec),
         .dst_base        (gelu_cmd_dst_dec),
-        .silu_mode       (1'b0),    // always GELU in GPT-2 block
+        .silu_mode       (silu_mode_dec),
         .sram_rd_en      (ge_rd_en),
         .sram_rd_addr    (ge_rd_addr),
         .sram_rd_data    (ge_rd_data),
@@ -777,7 +817,7 @@ module gpt2_block_top
     );
 
     // ================================================================
-    // Vec Engine (real hardware)
+    // Vec Engine
     // ================================================================
     vec_engine u_vec (
         .clk             (clk),
@@ -809,24 +849,72 @@ module gpt2_block_top
     );
 
     // ================================================================
+    // RMSNorm Engine
+    // ================================================================
+    rmsnorm_engine u_rmsnorm (
+        .clk             (clk),
+        .rst_n           (rst_n),
+        .cmd_valid       (rmsnorm_cmd_valid_dec),
+        .cmd_ready       (),
+        .length          (rmsnorm_cmd_len_dec),
+        .src_base        (rmsnorm_cmd_src0_dec),
+        .dst_base        (rmsnorm_cmd_dst_dec),
+        .gamma_base      (rmsnorm_cmd_gamma_dec),
+        .sram_rd0_en     (rn_rd0_en),
+        .sram_rd0_addr   (rn_rd0_addr),
+        .sram_rd0_data   (rn_rd0_data),
+        .sram_rd1_en     (rn_rd1_en),
+        .sram_rd1_addr   (rn_rd1_addr),
+        .sram_rd1_data   (rn_rd1_data),
+        .sram_wr_en      (rn_wr_en),
+        .sram_wr_addr    (rn_wr_addr),
+        .sram_wr_data    (rn_wr_data),
+        .busy            (rn_busy),
+        .done            (rn_done)
+    );
+
+    // ================================================================
+    // RoPE Engine
+    // ================================================================
+    rope_engine u_rope (
+        .clk             (clk),
+        .rst_n           (rst_n),
+        .cmd_valid       (rope_cmd_valid_dec),
+        .cmd_ready       (),
+        .src_base        (rope_cmd_src0_dec),
+        .dst_base        (rope_cmd_dst_dec),
+        .num_rows        (rope_cmd_num_rows_dec),
+        .head_dim        (rope_cmd_head_dim_dec),
+        .pos_offset      (rope_cmd_pos_offset_dec),
+        .sin_base        (rope_cmd_sin_base_dec),
+        .cos_base        (rope_cmd_cos_base_dec),
+        .sram_rd0_en     (rp_rd0_en),
+        .sram_rd0_addr   (rp_rd0_addr),
+        .sram_rd0_data   (rp_rd0_data),
+        .sram_rd1_en     (rp_rd1_en),
+        .sram_rd1_addr   (rp_rd1_addr),
+        .sram_rd1_data   (rp_rd1_data),
+        .sram_wr_en      (rp_wr_en),
+        .sram_wr_addr    (rp_wr_addr),
+        .sram_wr_data    (rp_wr_data),
+        .busy            (rp_busy),
+        .done            (rp_done)
+    );
+
+    // ================================================================
     // Engine done vector wiring
-    // All GEMMs now run on HW - no shim merge needed
     // ================================================================
     assign engine_done_vec[0] = gm_done;                  // ENG_GEMM
     assign engine_done_vec[1] = sm_done;                  // ENG_SOFTMAX
     assign engine_done_vec[2] = ln_done;                  // ENG_LAYERNORM
     assign engine_done_vec[3] = ge_done;                  // ENG_GELU
     assign engine_done_vec[4] = ve_done;                  // ENG_VEC
-    assign engine_done_vec[5] = dma_done_internal | kv_done_internal; // ENG_DMA (shared by DMA + KV)
-    assign engine_done_vec[6] = 1'b0;                    // ENG_RMSNORM (not present in GPT-2)
-    assign engine_done_vec[7] = 1'b0;                    // ENG_ROPE (not present in GPT-2)
+    assign engine_done_vec[5] = dma_done_internal | kv_done_internal; // ENG_DMA
+    assign engine_done_vec[6] = rn_done;                  // ENG_RMSNORM
+    assign engine_done_vec[7] = rp_done;                  // ENG_ROPE
 
     // ================================================================
     // program_end latch
-    // fetch_done fires when the fetch reads OP_END from SRAM (without
-    // dispatching it).  We must wait until all engines drain before
-    // signalling program_end, otherwise the TB reads SRAM while an
-    // engine still owns the port mux.
     // ================================================================
     logic fetch_done_latch;
     always_ff @(posedge clk or negedge rst_n) begin
@@ -852,16 +940,15 @@ module gpt2_block_top
     // ================================================================
     // Debug outputs
     // ================================================================
-    assign engine_busy_dbg   = engine_busy_vec;
-    assign all_idle_dbg      = all_idle;
-    assign softmax_busy_dbg  = sm_busy;
+    assign engine_busy_dbg = engine_busy_vec;
+    assign all_idle_dbg    = all_idle;
     assign softmax_done_dbg  = sm_done;
-    assign layernorm_busy_dbg = ln_busy;
     assign layernorm_done_dbg = ln_done;
-    assign gelu_busy_dbg     = ge_busy;
     assign gelu_done_dbg     = ge_done;
     assign vec_busy_dbg      = ve_busy;
     assign vec_done_dbg      = ve_done;
+    assign rmsnorm_done_dbg  = rn_done;
+    assign rope_done_dbg     = rp_done;
 
 endmodule
 

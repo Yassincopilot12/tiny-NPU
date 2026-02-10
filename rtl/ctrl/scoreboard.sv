@@ -40,7 +40,7 @@ module scoreboard
 
     always_comb begin
         issue_onehot = '0;
-        if (issue_valid && (issue_engine_id < NUM_ENGINES[2:0])) begin
+        if (issue_valid && ({1'b0, issue_engine_id} < NUM_ENGINES[3:0])) begin
             issue_onehot[issue_engine_id] = 1'b1;
         end
     end

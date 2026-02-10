@@ -32,6 +32,9 @@ set(SV_COMMON
     ${RTL_DIR}/ops/layernorm_engine.sv
     ${RTL_DIR}/ops/gelu_lut.sv
     ${RTL_DIR}/ops/gelu_engine.sv
+    ${RTL_DIR}/ops/silu_lut.sv
+    ${RTL_DIR}/ops/rmsnorm_engine.sv
+    ${RTL_DIR}/ops/rope_engine.sv
 )
 
 # Top-level sim sources (includes bus, ctrl, full top)
@@ -64,6 +67,7 @@ set(VERILATOR_COMMON_ARGS
     -Wno-VARHIDDEN
     -Wno-WIDTH
     -Wno-BLKSEQ
+    -Wno-UNSIGNED
     --x-assign unique
     --x-initial unique
     -DSIMULATION
@@ -145,6 +149,31 @@ verilate(kv_cache_sim
     SOURCES ${SV_COMMON} ${SV_CTRL} ${SIM_DIR}/gpt2_block_top.sv
     TOP_MODULE gpt2_block_top
     PREFIX Vgpt2_block_top
+    VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
+        -GSRAM0_DEPTH=65536
+        -GSRAM1_DEPTH=8192
+)
+
+# ---- Target 7: LLaMA Transformer Block Test ----
+add_executable(llama_block_sim tb_llama_block.cpp)
+
+verilate(llama_block_sim
+    SOURCES ${SV_COMMON} ${SV_CTRL} ${SIM_DIR}/llama_block_top.sv
+    TOP_MODULE llama_block_top
+    PREFIX Vllama_block_top
+    VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
+        -GSRAM0_DEPTH=65536
+        -GSRAM1_DEPTH=4096
+)
+
+# ---- Target 8: LLaMA Inference Demo ----
+# Full autoregressive LLaMA inference (4 blocks + final RMSNorm + lm_head)
+add_executable(llama_demo_infer tb_llama_demo_infer.cpp)
+
+verilate(llama_demo_infer
+    SOURCES ${SV_COMMON} ${SV_CTRL} ${SIM_DIR}/llama_block_top.sv
+    TOP_MODULE llama_block_top
+    PREFIX Vllama_block_top
     VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
         -GSRAM0_DEPTH=65536
         -GSRAM1_DEPTH=8192

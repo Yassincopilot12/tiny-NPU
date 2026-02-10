@@ -108,6 +108,7 @@ module top
     logic [2:0]                  issue_engine_id;
     logic [NUM_ENGINES-1:0]      engine_busy;
     logic [NUM_ENGINES-1:0]      can_issue;
+    logic [7:0]                  can_issue_8;  // padded for ucode_decode (8-wide)
     logic [NUM_ENGINES-1:0]      engine_done_vec;
     logic                        all_idle;
 
@@ -362,6 +363,9 @@ module top
     // =========================================================================
     // Microcode Decode & Dispatch
     // =========================================================================
+    // Pad can_issue to 8 bits: engines 6,7 not present, mark always free
+    assign can_issue_8 = {2'b11, can_issue};
+
     ucode_decode u_decode (
         .clk                (clk),
         .rst_n              (rst_int_n),
@@ -369,7 +373,7 @@ module top
         .instr_data         (fetch_instr_data),
         .instr_ready        (fetch_instr_ready),
         // Scoreboard
-        .can_issue          (can_issue),
+        .can_issue          (can_issue_8),
         .all_idle           (all_idle),
         // GEMM
         .gemm_cmd_valid     (gemm_cmd_valid),
@@ -426,6 +430,23 @@ module top
         .kv_cmd_len         (),
         .kv_cmd_flags       (),
         .kv_cmd_imm         (),
+        // RMSNorm (unused in full top)
+        .rmsnorm_cmd_valid  (),
+        .rmsnorm_cmd_src0   (),
+        .rmsnorm_cmd_dst    (),
+        .rmsnorm_cmd_len    (),
+        .rmsnorm_cmd_gamma  (),
+        // RoPE (unused in full top)
+        .rope_cmd_valid     (),
+        .rope_cmd_src0      (),
+        .rope_cmd_dst       (),
+        .rope_cmd_num_rows  (),
+        .rope_cmd_head_dim  (),
+        .rope_cmd_pos_offset(),
+        .rope_cmd_sin_base  (),
+        .rope_cmd_cos_base  (),
+        // SiLU mode (unused in full top)
+        .silu_mode          (),
         // Barrier
         .barrier_trigger    (barrier_trigger),
         // Scoreboard issue
