@@ -674,6 +674,18 @@ cd ../../sim/verilator/build
 ./llama_demo_infer --datadir llama_demo_data_hf
 ```
 
+**HuggingFace Mistral-300M weights** (requires `huggingface_hub`, `safetensors`):
+
+Mistral uses an identical architecture to LLaMA (RMSNorm, RoPE, GQA, SwiGLU) with identical tensor naming, so the same `llama_demo_infer` testbench is reused with no changes.
+
+```bash
+cd npu/python/tools
+python3 mistral_gen_weights_hf.py --outdir ../../sim/verilator/build/mistral_demo_data
+
+cd ../../sim/verilator/build
+./llama_demo_infer --datadir mistral_demo_data
+```
+
 Expected output:
 ```
   Step  0: npu_tok=160 gold_tok=160 logit_max_err=0 EXACT
@@ -864,6 +876,7 @@ npu/
       quantize_pack.py         INT8 quantization + weights.bin packing
       llama_gen_weights.py     Generate random LLaMA weights + golden
       llama_gen_weights_hf.py  Generate LLaMA weights from HuggingFace MicroLlama
+      mistral_gen_weights_hf.py Generate LLaMA weights from HuggingFace Mistral-300M
       make_lut.py              LUT initialization file generator
       ucode_asm.py             Microcode assembler
     tests/
