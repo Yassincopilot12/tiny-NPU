@@ -163,7 +163,7 @@ verilate(llama_block_sim
     PREFIX Vllama_block_top
     VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
         -GSRAM0_DEPTH=65536
-        -GSRAM1_DEPTH=4096
+        -GSRAM1_DEPTH=8192
 )
 
 # ---- Target 8: LLaMA Inference Demo ----

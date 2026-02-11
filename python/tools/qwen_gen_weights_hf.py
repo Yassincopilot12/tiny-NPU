@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Generate LLaMA weights.bin + golden tokens from HuggingFace Mistral-300M weights.
+"""Generate LLaMA weights.bin + golden tokens from HuggingFace Qwen2-0.5B weights.
 
-Downloads ayousanz/mistral-300M (355M params, Mistral/LLaMA architecture with GQA),
+Downloads Qwen/Qwen2-0.5B (494M params, Qwen2 architecture with GQA + QKV bias),
 slices each weight tensor to our tiny NPU dimensions, quantizes to int8,
 runs golden inference, and outputs the same files as llama_gen_weights.py.
 
-Mistral uses an identical architecture to LLaMA (RMSNorm, RoPE, GQA, SwiGLU)
-with identical HuggingFace tensor naming, so the same extraction and golden
-inference code works unchanged.
+Qwen2 differences from LLaMA/Mistral:
+  - QKV bias: q_proj.bias, k_proj.bias, v_proj.bias (packed at BLK_BQ/BK/BV)
+  - Tied embeddings: no separate lm_head.weight (reuses embed_tokens.weight)
 
 Outputs:
-  weights.bin        - packed int8 weights (180800 bytes)
+  weights.bin        - packed int8 weights (181312 bytes)
   prompt_tokens.txt  - initial prompt token IDs
   golden_tokens.txt  - greedy-generated token IDs
   golden_logits.bin  - int8 logits at each step [N_GEN, VOCAB_SIZE]
@@ -36,23 +36,28 @@ from llama_map import (
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from golden.llama_infer_golden import TinyLLaMAGolden
 
-# ── Mistral-300M source dimensions ───────────────────────────────────
-HF_REPO       = "ayousanz/mistral-300M"
-HF_HIDDEN     = 1024
-HF_N_HEADS    = 16
-HF_N_KV_HEADS = 8
-HF_HEAD_DIM   = 64   # = 1024 / 16
-HF_FFN_DIM    = 2400
+# ── Qwen2-0.5B source dimensions ────────────────────────────────────
+HF_REPO       = "Qwen/Qwen2-0.5B"
+HF_HIDDEN     = 896
+HF_N_HEADS    = 14
+HF_N_KV_HEADS = 2
+HF_HEAD_DIM   = 64   # = 896 / 14
+HF_FFN_DIM    = 4864
 
 
 def load_hf_tensors(repo_id):
-    """Download and load Mistral safetensors as numpy arrays."""
+    """Download and load Qwen2 safetensors as numpy arrays.
+
+    Uses torch backend to handle bfloat16, then converts to float32 numpy.
+    """
     from huggingface_hub import hf_hub_download
-    from safetensors.numpy import load_file
+    import torch
+    from safetensors.torch import load_file
 
     path = hf_hub_download(repo_id=repo_id, filename="model.safetensors")
     print(f"Loaded model from: {path}")
-    tensors = load_file(path)
+    torch_tensors = load_file(path)
+    tensors = {k: v.float().numpy() for k, v in torch_tensors.items()}
     return tensors
 
 
@@ -72,28 +77,32 @@ def slice_qkv(weight, src_n_heads, src_head_dim, src_hidden,
     return w
 
 
+def slice_bias(bias, src_n_heads, src_head_dim, tgt_n_heads, tgt_head_dim):
+    """Slice Q/K/V bias to our tiny dimensions.
+
+    HF bias: [src_n_heads * src_head_dim]
+    Returns: [tgt_n_heads, tgt_head_dim]
+    """
+    b = bias.reshape(src_n_heads, src_head_dim)
+    b = b[:tgt_n_heads, :tgt_head_dim]
+    return b
+
+
 def slice_o_proj(weight, src_head_dim, tgt_n_heads, tgt_head_dim, tgt_hidden):
     """Slice O-projection weight, gathering correct head indices.
 
     HF o_proj.weight: [src_hidden, src_n_heads * src_head_dim]
     Our Wo:           [tgt_hidden, tgt_hidden]  (since n_q_heads * head_dim = hidden)
-
-    The input to O-proj is concatenated head outputs. We took heads 0..tgt_n_heads-1
-    and dims 0..tgt_head_dim-1 from each, so we need to gather the correct source
-    column indices.
     """
-    # Transpose to [src_n_heads * src_head_dim, src_hidden]
     wt = weight.T  # [src_n_heads * src_head_dim, src_hidden]
 
-    # Gather input indices corresponding to our selected heads/dims
     input_indices = []
     for h in range(tgt_n_heads):
         start = h * src_head_dim
         input_indices.extend(range(start, start + tgt_head_dim))
 
-    # Slice: gather selected input dims, take first tgt_hidden output dims
     wt_sliced = wt[input_indices, :tgt_hidden]  # [tgt_hidden, tgt_hidden]
-    return wt_sliced.T  # [tgt_hidden, tgt_hidden] — matches our Wo format
+    return wt_sliced.T  # [tgt_hidden, tgt_hidden]
 
 
 def extract_weights(tensors):
@@ -120,6 +129,11 @@ def extract_weights(tensors):
         for h in range(N_Q_HEADS):
             bw['Wq'][h] = quantize_tensor(q_sliced[h])
 
+        # Q bias
+        q_bias = tensors[f"{prefix}.self_attn.q_proj.bias"]
+        bw['bq'] = quantize_tensor(
+            slice_bias(q_bias, HF_N_HEADS, HF_HEAD_DIM, N_Q_HEADS, HEAD_DIM))
+
         # K projection
         k_weight = tensors[f"{prefix}.self_attn.k_proj.weight"]
         k_sliced = slice_qkv(k_weight, HF_N_KV_HEADS, HF_HEAD_DIM, HF_HIDDEN,
@@ -128,6 +142,11 @@ def extract_weights(tensors):
         for h in range(N_KV_HEADS):
             bw['Wk'][h] = quantize_tensor(k_sliced[h])
 
+        # K bias
+        k_bias = tensors[f"{prefix}.self_attn.k_proj.bias"]
+        bw['bk'] = quantize_tensor(
+            slice_bias(k_bias, HF_N_KV_HEADS, HF_HEAD_DIM, N_KV_HEADS, HEAD_DIM))
+
         # V projection
         v_weight = tensors[f"{prefix}.self_attn.v_proj.weight"]
         v_sliced = slice_qkv(v_weight, HF_N_KV_HEADS, HF_HEAD_DIM, HF_HIDDEN,
@@ -135,6 +154,11 @@ def extract_weights(tensors):
         bw['Wv'] = np.zeros((N_KV_HEADS, HIDDEN, HEAD_DIM), dtype=np.int8)
         for h in range(N_KV_HEADS):
             bw['Wv'][h] = quantize_tensor(v_sliced[h])
+
+        # V bias
+        v_bias = tensors[f"{prefix}.self_attn.v_proj.bias"]
+        bw['bv'] = quantize_tensor(
+            slice_bias(v_bias, HF_N_KV_HEADS, HF_HEAD_DIM, N_KV_HEADS, HEAD_DIM))
 
         # O projection
         o_weight = tensors[f"{prefix}.self_attn.o_proj.weight"]
@@ -147,7 +171,6 @@ def extract_weights(tensors):
             tensors[f"{prefix}.post_attention_layernorm.weight"][:HIDDEN])
 
         # MLP: gate, up, down
-        # HF gate_proj.weight: [FFN_DIM, HIDDEN] → transpose then slice
         gate_w = tensors[f"{prefix}.mlp.gate_proj.weight"]
         bw['W_gate'] = quantize_tensor(gate_w.T[:HIDDEN, :FFN_DIM])
 
@@ -162,16 +185,20 @@ def extract_weights(tensors):
     # ── Final RMSNorm ────────────────────────────────────────────────
     ln_f_gamma = quantize_gamma(tensors["model.norm.weight"][:HIDDEN])
 
-    # ── LM head ──────────────────────────────────────────────────────
-    lm_head_w = quantize_tensor(
-        tensors["lm_head.weight"][:VOCAB_SIZE, :HIDDEN])
+    # ── LM head (tied embeddings: reuse wte if lm_head not present) ─
+    if "lm_head.weight" in tensors:
+        lm_head_w = quantize_tensor(
+            tensors["lm_head.weight"][:VOCAB_SIZE, :HIDDEN])
+    else:
+        print("  lm_head.weight not found -> using tied embed_tokens.weight")
+        lm_head_w = wte  # already quantized
 
     return wte, blocks_weights, ln_f_gamma, lm_head_w
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Generate LLaMA demo weights from HuggingFace Mistral-300M")
+        description="Generate LLaMA demo weights from HuggingFace Qwen2-0.5B")
     ap.add_argument("--outdir", default=".", help="Output directory")
     ap.add_argument("--prompt", default="1,2,3,4",
                     help="Comma-separated prompt tokens")
@@ -190,7 +217,7 @@ def main():
           f"kv_heads={HF_N_KV_HEADS}, ffn={HF_FFN_DIM})")
 
     # ── Download and extract weights ─────────────────────────────────
-    print("\nDownloading Mistral-300M weights...")
+    print("\nDownloading Qwen2-0.5B weights...")
     tensors = load_hf_tensors(HF_REPO)
     print(f"Loaded {len(tensors)} tensors")
 
@@ -221,10 +248,10 @@ def main():
         put(base + BLK_W_GATE, bw['W_gate'])
         put(base + BLK_W_UP, bw['W_up'])
         put(base + BLK_W_DOWN, bw['W_down'])
-        # Zero QKV bias (Mistral has no QKV bias)
-        put(base + BLK_BQ, np.zeros(N_Q_HEADS * HEAD_DIM, dtype=np.int8))
-        put(base + BLK_BK, np.zeros(N_KV_HEADS * HEAD_DIM, dtype=np.int8))
-        put(base + BLK_BV, np.zeros(N_KV_HEADS * HEAD_DIM, dtype=np.int8))
+        # QKV bias
+        put(base + BLK_BQ, bw['bq'])
+        put(base + BLK_BK, bw['bk'])
+        put(base + BLK_BV, bw['bv'])
 
     put(LN_F_OFFSET, ln_f_gamma)
     put(LM_HEAD_OFFSET, lm_head_w)

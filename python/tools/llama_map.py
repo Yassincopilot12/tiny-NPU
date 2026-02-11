@@ -59,6 +59,11 @@ S1_ROPE_SIN   = 0x0080   # [16,8]   = 128B   (int8, Q1.7)
 S1_ROPE_COS   = 0x0100   # [16,8]   = 128B   (int8, Q1.7)
 S1_RESID      = 0x0180   # [S,64]   = 1024B  (residual source)
 
+# SRAM1 addresses for replicated QKV bias (bias vector replicated S times)
+S1_BIAS_Q     = 0x0E40   # N_Q_HEADS * [S,HEAD_DIM] = 4*[16,16] = 1024B
+S1_BIAS_K     = 0x1240   # N_KV_HEADS * [S,HEAD_DIM] = 2*[16,16] = 512B
+S1_BIAS_V     = 0x1440   # N_KV_HEADS * [S,HEAD_DIM] = 2*[16,16] = 512B
+
 # ── Per-head address helpers ─────────────────────────────────────────────
 def wq_head_addr(h):
     """SRAM0 address for Q-head h's WQ slice [64,16]."""
@@ -72,11 +77,24 @@ def wv_head_addr(kv_h):
     """SRAM0 address for KV-head kv_h's WV slice [64,16]."""
     return ADDR_WV + kv_h * HIDDEN * HEAD_DIM
 
+def bq_head_addr(h):
+    """Block offset for Q-head h's bias [HEAD_DIM]."""
+    return BLK_BQ + h * HEAD_DIM
+
+def bk_head_addr(kv_h):
+    """Block offset for KV-head kv_h's K bias [HEAD_DIM]."""
+    return BLK_BK + kv_h * HEAD_DIM
+
+def bv_head_addr(kv_h):
+    """Block offset for KV-head kv_h's V bias [HEAD_DIM]."""
+    return BLK_BV + kv_h * HEAD_DIM
+
 # ── weights.bin layout (offsets in bytes) ─────────────────────────────────
 WTE_OFFSET      = 0
 WTE_SIZE        = VOCAB_SIZE * HIDDEN                        # 16384
 
-LLAMA_BLOCK_SIZE = (64 + 4096 + 2048 + 2048 + 4096 + 64 + 8192 + 8192 + 8192)  # 36992
+LLAMA_BLOCK_SIZE = (64 + 4096 + 2048 + 2048 + 4096 + 64 + 8192 + 8192 + 8192
+                    + N_Q_HEADS * HEAD_DIM + N_KV_HEADS * HEAD_DIM + N_KV_HEADS * HEAD_DIM)  # 37120
 BLOCKS_OFFSET    = WTE_OFFSET + WTE_SIZE                     # 16384
 # Within each block:
 BLK_RMS1_GAMMA = 0         # 64B
@@ -88,12 +106,16 @@ BLK_RMS2_GAMMA = 12352     # 64B
 BLK_W_GATE     = 12416     # 8192B
 BLK_W_UP       = 20608     # 8192B
 BLK_W_DOWN     = 28800     # 8192B
+# QKV bias (appended after W_down)
+BLK_BQ         = 36992     # N_Q_HEADS * HEAD_DIM = 64B
+BLK_BK         = 36992 + N_Q_HEADS * HEAD_DIM          # 37056, N_KV_HEADS * HEAD_DIM = 32B
+BLK_BV         = 36992 + N_Q_HEADS * HEAD_DIM + N_KV_HEADS * HEAD_DIM  # 37088, 32B
 
-LN_F_OFFSET     = BLOCKS_OFFSET + N_LAYERS * LLAMA_BLOCK_SIZE  # 164352
+LN_F_OFFSET     = BLOCKS_OFFSET + N_LAYERS * LLAMA_BLOCK_SIZE  # 164864
 LN_F_SIZE       = 64
-LM_HEAD_OFFSET  = LN_F_OFFSET + LN_F_SIZE                      # 164416
+LM_HEAD_OFFSET  = LN_F_OFFSET + LN_F_SIZE                      # 164928
 LM_HEAD_SIZE    = VOCAB_SIZE * HIDDEN                           # 16384
-WEIGHTS_TOTAL   = LM_HEAD_OFFSET + LM_HEAD_SIZE                # 180800
+WEIGHTS_TOTAL   = LM_HEAD_OFFSET + LM_HEAD_SIZE                # 181312
 
 
 def quantize_tensor(w_fp32, target_max=QUANT_WEIGHT_MAX):

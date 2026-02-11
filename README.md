@@ -2,7 +2,7 @@
 
 A minimal transformer inference accelerator in SystemVerilog, optimized for learning how NPUs (Neural Processing Units) work from the ground up.
 
-Built with fully documented SystemVerilog RTL, a complete 128-bit microcode ISA, working GPT-2 and LLaMA inference running on real HuggingFace weights, KV-cache optimization, and full Verilator simulation with cycle-accurate verification.
+Built with fully documented SystemVerilog RTL, a complete 128-bit microcode ISA, working GPT-2, LLaMA, Mistral and Qwen2 inference running on real HuggingFace weights, KV-cache optimization, and full Verilator simulation with cycle-accurate verification.
 
 ### Table of Contents
 
@@ -49,7 +49,7 @@ With this motivation in mind, we can strip away the complexity of production-gra
 4. **Memory Management** - How do you fit weights, activations, and intermediate results in limited on-chip SRAM?
 5. **KV-Cache Optimization** - How does caching key/value vectors make autoregressive decoding faster?
 
-The result: a chip that loads real GPT-2 and LLaMA weights from HuggingFace, runs INT8 quantized inference through 4 transformer layers with multi-head attention (MHA for GPT-2, GQA for LLaMA), and generates tokens - all verified cycle-accurate against Python and C++ golden models.
+The result: a chip that loads real GPT-2, LLaMA, Mistral and Qwen2 weights from HuggingFace, runs INT8 quantized inference through 4 transformer layers with multi-head attention (MHA for GPT-2, GQA for LLaMA/Mistral/Qwen2), and generates tokens - all verified cycle-accurate against Python and C++ golden models.
 
 # Architecture
 
@@ -515,6 +515,23 @@ tiny-npu runs real GPT-2 inference, not a toy example. Here's what happens end-t
 | Max sequence | 16 | Fits in 64KB SRAM with all weights |
 | Quantization | INT8 | Per-tensor symmetric, shift=2 (K=64), shift=7 (K=16), shift=2 (K=128) |
 
+### Qwen2 Model Configuration
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Hidden dimension | 64 | First 64 of Qwen2-0.5B's 896 |
+| Layers | 4 | First 4 of Qwen2-0.5B's 24 |
+| Q attention heads | 4 | 4 heads x 16 head_dim = 64 hidden |
+| KV attention heads | 2 | Grouped-Query Attention (GQA ratio = 2) |
+| Head dimension | 16 | With RoPE positional encoding |
+| FFN dimension | 128 | SwiGLU (gate + up + down projections) |
+| Vocabulary | 256 | Byte-level (first 256 Qwen2 tokens) |
+| QKV bias | Yes | Applied via VEC_ADD after each Q/K/V GEMM |
+| Tied embeddings | Yes | lm_head reuses embed_tokens weights |
+| Quantization | INT8 | Same as LLaMA |
+
+Qwen2 uses the same LLaMA pipeline (RMSNorm, RoPE, GQA, SwiGLU) with two additions: **QKV bias** vectors added after each Q/K/V projection via `VEC_ADD` instructions, and **tied embeddings** where the language model head reuses the token embedding weights. The bias support requires no RTL changes — the existing `VEC_ADD` engine handles it by reading bias vectors replicated in SRAM1.
+
 #### LLaMA-Specific Hardware
 
 The LLaMA pipeline adds three new engines beyond GPT-2:
@@ -686,6 +703,18 @@ cd ../../sim/verilator/build
 ./llama_demo_infer --datadir mistral_demo_data
 ```
 
+**HuggingFace Qwen2-0.5B weights** (requires `huggingface_hub`, `safetensors`):
+
+Qwen2 uses the same RMSNorm + RoPE + GQA + SwiGLU architecture as LLaMA, but adds **QKV bias** (`q_proj.bias`, `k_proj.bias`, `v_proj.bias`) and uses **tied embeddings** (no separate `lm_head.weight`). The bias is applied via `VEC_ADD` instructions after each Q/K/V GEMM, requiring no RTL changes.
+
+```bash
+cd npu/python/tools
+python3 qwen_gen_weights_hf.py --outdir ../../sim/verilator/build/qwen_demo_data
+
+cd ../../sim/verilator/build
+./llama_demo_infer --datadir qwen_demo_data
+```
+
 Expected output:
 ```
   Step  0: npu_tok=160 gold_tok=160 logit_max_err=0 EXACT
@@ -789,7 +818,7 @@ Improvements I want to make to the design:
 - [ ] Scale to full GPT-2 dimensions (hidden=768) with weight streaming
 - [ ] Add FP16 accumulation mode for better dynamic range
 - [ ] FPGA synthesis and on-board demo (Xilinx Zynq / Artix-7)
-- [x] Support for more model architectures (LLaMA-style RoPE, GQA)
+- [x] Support for more model architectures (LLaMA, Mistral, Qwen2 with GQA, RoPE, QKV bias)
 
 # Repository Structure
 
@@ -840,7 +869,7 @@ npu/
       mean_var_engine.sv       Mean and variance computation
   sim/
     verilator/               Verilator simulation environment
-      CMakeLists.txt           Build system (6 targets)
+      CMakeLists.txt           Build system (8 targets)
       gpt2_block_top.sv        GPT-2 testbench top (SRAMs + ucode + engines)
       llama_block_top.sv       LLaMA testbench top (SRAMs + ucode + engines)
       engine_tb_top.sv         Engine-level testbench wrapper
@@ -877,6 +906,7 @@ npu/
       llama_gen_weights.py     Generate random LLaMA weights + golden
       llama_gen_weights_hf.py  Generate LLaMA weights from HuggingFace MicroLlama
       mistral_gen_weights_hf.py Generate LLaMA weights from HuggingFace Mistral-300M
+      qwen_gen_weights_hf.py   Generate LLaMA weights from HuggingFace Qwen2-0.5B (QKV bias)
       make_lut.py              LUT initialization file generator
       ucode_asm.py             Microcode assembler
     tests/

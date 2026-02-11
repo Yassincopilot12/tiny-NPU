@@ -17,6 +17,7 @@ from llama_map import (
     WTE_OFFSET, BLOCKS_OFFSET, LLAMA_BLOCK_SIZE,
     BLK_RMS1_GAMMA, BLK_WQ, BLK_WK, BLK_WV, BLK_WO,
     BLK_RMS2_GAMMA, BLK_W_GATE, BLK_W_UP, BLK_W_DOWN,
+    BLK_BQ, BLK_BK, BLK_BV,
     LN_F_OFFSET, LM_HEAD_OFFSET, WEIGHTS_TOTAL,
     GEMM_SCALE, GEMM_SHIFT, GEMM_SHIFT_K16, GEMM_SHIFT_K128,
 )
@@ -103,6 +104,10 @@ def main():
         put(base + BLK_W_GATE, bw['W_gate'])
         put(base + BLK_W_UP, bw['W_up'])
         put(base + BLK_W_DOWN, bw['W_down'])
+        # Zero QKV bias (no bias for random LLaMA)
+        put(base + BLK_BQ, np.zeros(N_Q_HEADS * HEAD_DIM, dtype=np.int8))
+        put(base + BLK_BK, np.zeros(N_KV_HEADS * HEAD_DIM, dtype=np.int8))
+        put(base + BLK_BV, np.zeros(N_KV_HEADS * HEAD_DIM, dtype=np.int8))
 
     put(LN_F_OFFSET, ln_f_gamma)
     put(LM_HEAD_OFFSET, lm_head_w)

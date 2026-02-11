@@ -57,6 +57,11 @@ class TinyLLaMAGolden:
         self.W_up = rng.randint(-4, 5, (hidden, ffn_dim)).astype(np.int8)
         self.W_down = rng.randint(-4, 5, (ffn_dim, hidden)).astype(np.int8)
 
+        # QKV bias (None = no bias, for LLaMA/Mistral)
+        self.bq = None   # [n_q_heads, head_dim]
+        self.bk = None   # [n_kv_heads, head_dim]
+        self.bv = None   # [n_kv_heads, head_dim]
+
     def run_block(self, x):
         """
         Full LLaMA transformer block forward pass.
@@ -84,6 +89,14 @@ class TinyLLaMAGolden:
                             scale=self.scale, shift=self.shift_k64)
             v_h = gemm_int8(rms1_out, self.Wv[kv_h],
                             scale=self.scale, shift=self.shift_k64)
+
+            # QKV bias (Qwen2-style)
+            if self.bq is not None:
+                q_h = clamp_i8(q_h.astype(np.int16) + self.bq[h].astype(np.int16))
+            if self.bk is not None:
+                k_h = clamp_i8(k_h.astype(np.int16) + self.bk[kv_h].astype(np.int16))
+            if self.bv is not None:
+                v_h = clamp_i8(v_h.astype(np.int16) + self.bv[kv_h].astype(np.int16))
 
             # Apply RoPE to Q and K
             q_h = rope_fixed(q_h, self.sin_table, self.cos_table, pos_offset=0)
@@ -171,6 +184,9 @@ class TinyLLaMAGolden:
             self.W_gate = block_w['W_gate']
             self.W_up = block_w['W_up']
             self.W_down = block_w['W_down']
+            self.bq = block_w.get('bq', None)
+            self.bk = block_w.get('bk', None)
+            self.bv = block_w.get('bv', None)
             x = self.run_block(x)
 
         # Final RMSNorm

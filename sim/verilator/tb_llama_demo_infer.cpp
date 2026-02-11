@@ -102,6 +102,10 @@ static const uint16_t S1_ROPE_COS   = 0x0100;  // [16,8] = 128B
 static const uint16_t S1_RESID      = 0x0180;  // [S,64] = 1024B (residual source)
 static const uint16_t S1_FFN_UP     = 0x0600;  // [S,128] = 2048B (for VEC MUL staging)
 static const uint16_t S1_LN_F_GAMMA = 0x0E00;  // [64] (final RMSNorm gamma)
+// SRAM1 addresses for replicated QKV bias
+static const uint16_t S1_BIAS_Q     = 0x0E40;  // N_Q_HEADS * [S,HEAD_DIM] = 1024B
+static const uint16_t S1_BIAS_K     = 0x1240;  // N_KV_HEADS * [S,HEAD_DIM] = 512B
+static const uint16_t S1_BIAS_V     = 0x1440;  // N_KV_HEADS * [S,HEAD_DIM] = 512B
 
 // =============================================================================
 // weights.bin layout offsets (must match llama_map.py)
@@ -109,7 +113,8 @@ static const uint16_t S1_LN_F_GAMMA = 0x0E00;  // [64] (final RMSNorm gamma)
 static const int WTE_OFFSET     = 0;
 static const int WTE_SIZE_B     = VOCAB_SIZE * HIDDEN;                        // 16384
 static const int BLOCKS_OFFSET  = WTE_OFFSET + WTE_SIZE_B;                   // 16384
-static const int BLOCK_SIZE_B   = 64 + 4096 + 2048 + 2048 + 4096 + 64 + 8192 + 8192 + 8192; // 36992
+static const int BLOCK_SIZE_B   = 64 + 4096 + 2048 + 2048 + 4096 + 64 + 8192 + 8192 + 8192
+                                + N_Q_HEADS * HEAD_DIM + N_KV_HEADS * HEAD_DIM + N_KV_HEADS * HEAD_DIM; // 37120
 static const int BLK_RMS1_GAMMA = 0;
 static const int BLK_WQ         = 64;
 static const int BLK_WK         = 4160;
@@ -119,11 +124,15 @@ static const int BLK_RMS2_GAMMA = 12352;
 static const int BLK_W_GATE     = 12416;
 static const int BLK_W_UP       = 20608;
 static const int BLK_W_DOWN     = 28800;
-static const int LN_F_OFFSET    = BLOCKS_OFFSET + N_LAYERS * BLOCK_SIZE_B;   // 164352
+// QKV bias offsets (appended after W_down)
+static const int BLK_BQ         = 36992;
+static const int BLK_BK         = 36992 + N_Q_HEADS * HEAD_DIM;              // 37056
+static const int BLK_BV         = 36992 + N_Q_HEADS * HEAD_DIM + N_KV_HEADS * HEAD_DIM; // 37088
+static const int LN_F_OFFSET    = BLOCKS_OFFSET + N_LAYERS * BLOCK_SIZE_B;   // 164864
 static const int LN_F_SIZE      = 64;
-static const int LM_HEAD_OFFSET = LN_F_OFFSET + LN_F_SIZE;                   // 164416
+static const int LM_HEAD_OFFSET = LN_F_OFFSET + LN_F_SIZE;                   // 164928
 static const int LM_HEAD_SIZE   = VOCAB_SIZE * HIDDEN;                       // 16384
-static const int WEIGHTS_TOTAL  = LM_HEAD_OFFSET + LM_HEAD_SIZE;             // 180800
+static const int WEIGHTS_TOTAL  = LM_HEAD_OFFSET + LM_HEAD_SIZE;             // 181312
 
 // =============================================================================
 // Opcodes and Flags (from tb_llama_block.cpp)
@@ -458,6 +467,20 @@ void vec_mul_golden(const int8_t* src0, const int8_t* src1, int8_t* dst, int len
 }
 
 // =============================================================================
+// C++ Bias Add Golden: add [HEAD_DIM] bias to each row of [S, HEAD_DIM]
+// =============================================================================
+void bias_add_golden(int8_t* data, const int8_t* bias, int S, int head_dim) {
+    for (int s = 0; s < S; s++) {
+        for (int d = 0; d < head_dim; d++) {
+            int16_t sum = (int16_t)data[s * head_dim + d] + (int16_t)bias[d];
+            if (sum > 127) sum = 127;
+            if (sum < -128) sum = -128;
+            data[s * head_dim + d] = (int8_t)sum;
+        }
+    }
+}
+
+// =============================================================================
 // RoPE table generation (matches make_lut.py gen_rope_tables)
 // =============================================================================
 static int8_t rope_sin_table[MAX_SEQ * HALF_DIM];
@@ -494,12 +517,16 @@ struct BlockWeights {
     const int8_t* w_gate;      // [HIDDEN, FFN_DIM]
     const int8_t* w_up;        // [HIDDEN, FFN_DIM]
     const int8_t* w_down;      // [FFN_DIM, HIDDEN]
+    const int8_t* bq;          // [N_Q_HEADS * HEAD_DIM] Q bias
+    const int8_t* bk;          // [N_KV_HEADS * HEAD_DIM] K bias
+    const int8_t* bv;          // [N_KV_HEADS * HEAD_DIM] V bias
 };
 
 static BlockWeights block_weights[N_LAYERS];
 static const int8_t* wte;          // [VOCAB_SIZE, HIDDEN]
 static const int8_t* ln_f_gamma;   // [HIDDEN]
 static const int8_t* lm_head;      // [VOCAB_SIZE, HIDDEN]
+static bool has_qkv_bias = false;   // true if any bias is nonzero
 
 bool load_weights(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -531,12 +558,27 @@ bool load_weights(const std::string& path) {
         block_weights[i].w_gate     = weights_buf.data() + base + BLK_W_GATE;
         block_weights[i].w_up       = weights_buf.data() + base + BLK_W_UP;
         block_weights[i].w_down     = weights_buf.data() + base + BLK_W_DOWN;
+        block_weights[i].bq         = weights_buf.data() + base + BLK_BQ;
+        block_weights[i].bk         = weights_buf.data() + base + BLK_BK;
+        block_weights[i].bv         = weights_buf.data() + base + BLK_BV;
     }
 
     ln_f_gamma = weights_buf.data() + LN_F_OFFSET;
     lm_head    = weights_buf.data() + LM_HEAD_OFFSET;
 
+    // Detect nonzero bias (Qwen2 has QKV bias, LLaMA/Mistral do not)
+    has_qkv_bias = false;
+    for (int i = 0; i < N_LAYERS && !has_qkv_bias; i++) {
+        for (int j = 0; j < N_Q_HEADS * HEAD_DIM; j++)
+            if (block_weights[i].bq[j] != 0) { has_qkv_bias = true; break; }
+        if (!has_qkv_bias)
+            for (int j = 0; j < N_KV_HEADS * HEAD_DIM; j++)
+                if (block_weights[i].bk[j] != 0 || block_weights[i].bv[j] != 0)
+                    { has_qkv_bias = true; break; }
+    }
+
     std::cout << "Loaded weights: " << sz << " bytes from " << path << std::endl;
+    std::cout << "  QKV bias: " << (has_qkv_bias ? "ENABLED" : "disabled") << std::endl;
     return true;
 }
 
@@ -606,6 +648,16 @@ int gen_block_microcode(int S, int ucode_addr) {
         encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
         ucode_write(addr++, hi, lo);
 
+        // VEC ADD Q bias (if present)
+        if (has_qkv_bias) {
+            uint16_t bq_sram1 = S1_BIAS_Q + h * S * HEAD_DIM;
+            encode_instr(OP_VEC, 0x00, ADDR_Q_H, ADDR_Q_H, bq_sram1,
+                         0, S * HEAD_DIM, 0, 0, hi, lo);
+            ucode_write(addr++, hi, lo);
+            encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+            ucode_write(addr++, hi, lo);
+        }
+
         // GEMM K_h = RMS1_OUT * Wk_h
         encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_K_H, ADDR_RMS1_OUT, wk_h_addr,
                      S, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
@@ -613,12 +665,32 @@ int gen_block_microcode(int S, int ucode_addr) {
         encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
         ucode_write(addr++, hi, lo);
 
+        // VEC ADD K bias (if present)
+        if (has_qkv_bias) {
+            uint16_t bk_sram1 = S1_BIAS_K + kv_h * S * HEAD_DIM;
+            encode_instr(OP_VEC, 0x00, ADDR_K_H, ADDR_K_H, bk_sram1,
+                         0, S * HEAD_DIM, 0, 0, hi, lo);
+            ucode_write(addr++, hi, lo);
+            encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+            ucode_write(addr++, hi, lo);
+        }
+
         // GEMM V_h = RMS1_OUT * Wv_h
         encode_instr(OP_GEMM, FLAG_REQUANT, ADDR_V_H, ADDR_RMS1_OUT, wv_h_addr,
                      S, HEAD_DIM, HIDDEN, GEMM_IMM_K64, hi, lo);
         ucode_write(addr++, hi, lo);
         encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
         ucode_write(addr++, hi, lo);
+
+        // VEC ADD V bias (if present)
+        if (has_qkv_bias) {
+            uint16_t bv_sram1 = S1_BIAS_V + kv_h * S * HEAD_DIM;
+            encode_instr(OP_VEC, 0x00, ADDR_V_H, ADDR_V_H, bv_sram1,
+                         0, S * HEAD_DIM, 0, 0, hi, lo);
+            ucode_write(addr++, hi, lo);
+            encode_instr(OP_BARRIER, 0, 0, 0, 0, 0, 0, 0, 0, hi, lo);
+            ucode_write(addr++, hi, lo);
+        }
 
         // ROPE Q_h
         encode_instr(OP_ROPE, 0, ADDR_Q_H, ADDR_Q_H, S1_ROPE_SIN,
@@ -885,6 +957,34 @@ void load_block_to_srams(int blk_idx, const int8_t* x_data, int S) {
     // SRAM1: copy X for first residual add
     for (int i = 0; i < S * HIDDEN; i++)
         sram1_write(S1_RESID + i, (uint8_t)x_data[i]);
+
+    // SRAM1: replicate QKV bias (if present)
+    if (has_qkv_bias) {
+        // Q bias: replicate [HEAD_DIM] -> [S, HEAD_DIM] for each Q-head
+        for (int h = 0; h < N_Q_HEADS; h++) {
+            uint16_t base = S1_BIAS_Q + h * S * HEAD_DIM;
+            for (int s = 0; s < S; s++)
+                for (int d = 0; d < HEAD_DIM; d++)
+                    sram1_write(base + s * HEAD_DIM + d,
+                               (uint8_t)bw.bq[h * HEAD_DIM + d]);
+        }
+        // K bias: replicate for each KV-head
+        for (int h = 0; h < N_KV_HEADS; h++) {
+            uint16_t base = S1_BIAS_K + h * S * HEAD_DIM;
+            for (int s = 0; s < S; s++)
+                for (int d = 0; d < HEAD_DIM; d++)
+                    sram1_write(base + s * HEAD_DIM + d,
+                               (uint8_t)bw.bk[h * HEAD_DIM + d]);
+        }
+        // V bias: replicate for each KV-head
+        for (int h = 0; h < N_KV_HEADS; h++) {
+            uint16_t base = S1_BIAS_V + h * S * HEAD_DIM;
+            for (int s = 0; s < S; s++)
+                for (int d = 0; d < HEAD_DIM; d++)
+                    sram1_write(base + s * HEAD_DIM + d,
+                               (uint8_t)bw.bv[h * HEAD_DIM + d]);
+        }
+    }
 }
 
 // =============================================================================
@@ -929,6 +1029,13 @@ void golden_block(const int8_t* x_in, int8_t* x_out, int S, int blk_idx) {
         gemm_golden(rms1.data(), wq_h, q_h.data(), S, HEAD_DIM, HIDDEN, false, scale, shift_k64);
         gemm_golden(rms1.data(), wk_h, k_h.data(), S, HEAD_DIM, HIDDEN, false, scale, shift_k64);
         gemm_golden(rms1.data(), wv_h, v_h.data(), S, HEAD_DIM, HIDDEN, false, scale, shift_k64);
+
+        // QKV bias add
+        if (has_qkv_bias) {
+            bias_add_golden(q_h.data(), bw.bq + h * HEAD_DIM, S, HEAD_DIM);
+            bias_add_golden(k_h.data(), bw.bk + kv_h * HEAD_DIM, S, HEAD_DIM);
+            bias_add_golden(v_h.data(), bw.bv + kv_h * HEAD_DIM, S, HEAD_DIM);
+        }
 
         // Apply RoPE
         rope_golden(q_h.data(), S, HEAD_DIM, rope_sin_table, rope_cos_table, 0);
