@@ -77,6 +77,17 @@ set(VERILATOR_COMMON_ARGS
     -I${RTL_DIR}/ctrl
     -I${RTL_DIR}/gemm
     -I${RTL_DIR}/ops
+    -I${RTL_DIR}/graph
+)
+
+# Graph mode RTL sources
+set(SV_GRAPH
+    ${RTL_DIR}/graph/graph_isa_pkg.sv
+    ${RTL_DIR}/graph/tensor_table.sv
+    ${RTL_DIR}/graph/graph_fetch.sv
+    ${RTL_DIR}/graph/graph_decode.sv
+    ${RTL_DIR}/graph/graph_dispatch.sv
+    ${RTL_DIR}/graph/graph_top.sv
 )
 
 # ---- Target 1: Control Plane Smoke Test (original top-level) ----
@@ -177,4 +188,30 @@ verilate(llama_demo_infer
     VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
         -GSRAM0_DEPTH=65536
         -GSRAM1_DEPTH=8192
+)
+
+# ---- Target 9: ONNX Graph Mode MLP Smoke Test ----
+add_executable(onnx_smoke_sim tb_onnx_smoke.cpp)
+
+verilate(onnx_smoke_sim
+    SOURCES ${SV_COMMON} ${SV_GRAPH}
+        ${RTL_DIR}/gemm/gemm_ctrl.sv
+        ${SIM_DIR}/onnx_sim_top.sv
+    TOP_MODULE onnx_sim_top
+    PREFIX Vonnx_sim_top
+    VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
+        -GSRAM0_DEPTH=65536
+)
+
+# ---- Target 10: ONNX Graph Mode CNN Smoke Test ----
+add_executable(onnx_cnn_smoke_sim tb_onnx_cnn_smoke.cpp)
+
+verilate(onnx_cnn_smoke_sim
+    SOURCES ${SV_COMMON} ${SV_GRAPH}
+        ${RTL_DIR}/gemm/gemm_ctrl.sv
+        ${SIM_DIR}/onnx_sim_top.sv
+    TOP_MODULE onnx_sim_top
+    PREFIX Vonnx_sim_top
+    VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
+        -GSRAM0_DEPTH=65536
 )

@@ -1,8 +1,8 @@
 # tiny-npu
 
-A minimal transformer inference accelerator in SystemVerilog, optimized for learning how NPUs (Neural Processing Units) work from the ground up.
+A minimal neural processing unit in SystemVerilog, optimized for learning how NPUs work from the ground up.
 
-Built with fully documented SystemVerilog RTL, a complete 128-bit microcode ISA, working GPT-2, LLaMA, Mistral and Qwen2 inference running on real HuggingFace weights, KV-cache optimization, and full Verilator simulation with cycle-accurate verification.
+Built with fully documented SystemVerilog RTL, two execution modes (LLM Mode for transformer inference and Graph Mode for ONNX models), a complete 128-bit microcode ISA, working GPT-2, LLaMA, Mistral and Qwen2 inference running on real HuggingFace weights, KV-cache optimization, an ONNX compiler for MLP and CNN models, and full Verilator simulation with cycle-accurate verification.
 
 ### Table of Contents
 
@@ -11,11 +11,19 @@ Built with fully documented SystemVerilog RTL, a complete 128-bit microcode ISA,
   - [NPU](#npu)
   - [Memory](#memory)
   - [Engines](#engines)
-- [ISA](#isa)
-- [Execution](#execution)
+- [Execution Modes](#execution-modes)
+  - [LLM Mode](#llm-mode)
+  - [Graph Mode (ONNX)](#graph-mode-onnx)
+- [LLM Mode ISA](#llm-mode-isa)
+- [LLM Mode Execution](#llm-mode-execution)
   - [Microcode Controller](#microcode-controller)
   - [Transformer Block](#transformer-block)
   - [KV-Cache Decode](#kv-cache-decode)
+- [Graph Mode ISA](#graph-mode-isa)
+- [Graph Mode Execution](#graph-mode-execution)
+  - [Graph Pipeline](#graph-pipeline)
+  - [Tensor Descriptor Table](#tensor-descriptor-table)
+  - [ONNX Compiler](#onnx-compiler)
 - [Inference Demo](#inference-demo)
 - [Simulation](#simulation)
 - [Advanced Functionality](#advanced-functionality)
@@ -37,19 +45,20 @@ This is why I built `tiny-npu`.
 
 > [!IMPORTANT]
 >
-> **tiny-npu** is a minimal, fully synthesizable transformer inference accelerator in SystemVerilog, optimized for learning about how NPUs work from the ground up.
+> **tiny-npu** is a minimal, fully synthesizable neural processing unit in SystemVerilog, optimized for learning about how NPUs work from the ground up.
 >
-> Rather than building a general-purpose matrix accelerator, tiny-npu focuses on implementing every operation needed to run a real transformer model end-to-end - from GEMM to Softmax to LayerNorm - so you can see exactly how silicon turns weights into words.
+> It supports two execution modes: **LLM Mode** for running real transformer models (GPT-2, LLaMA, Mistral, Qwen2) with a 128-bit microcode ISA, and **Graph Mode** for running ONNX models (MLP, CNN) with a dedicated graph ISA and tensor descriptor table. Both modes share the same compute engines (systolic array, softmax, etc.) and on-chip SRAM.
 
-With this motivation in mind, we can strip away the complexity of production-grade accelerators (multi-chip interconnects, HBM controllers, sparsity engines) and focus on the core elements that make transformer inference work in hardware:
+With this motivation in mind, we can strip away the complexity of production-grade accelerators (multi-chip interconnects, HBM controllers, sparsity engines) and focus on the core elements that make neural network inference work in hardware:
 
 1. **Systolic Array** - How does a 16x16 grid of multiply-accumulate units perform matrix multiplication?
 2. **Fixed-Point Arithmetic** - How do you compute softmax, layer normalization, and GELU without floating point?
 3. **Microcode Sequencing** - How does a controller orchestrate dozens of operations to execute a full transformer block?
 4. **Memory Management** - How do you fit weights, activations, and intermediate results in limited on-chip SRAM?
 5. **KV-Cache Optimization** - How does caching key/value vectors make autoregressive decoding faster?
+6. **Graph Execution** - How does a hardware FSM walk an ONNX computation graph, issuing DMA, GEMM, and element-wise ops automatically?
 
-The result: a chip that loads real GPT-2, LLaMA, Mistral and Qwen2 weights from HuggingFace, runs INT8 quantized inference through 4 transformer layers with multi-head attention (MHA for GPT-2, GQA for LLaMA/Mistral/Qwen2), and generates tokens - all verified cycle-accurate against Python and C++ golden models.
+The result: a chip that runs real GPT-2, LLaMA, Mistral and Qwen2 weights from HuggingFace through INT8 quantized inference with multi-head attention, and also compiles and executes arbitrary ONNX MLP/CNN models end-to-end - all verified cycle-accurate against Python and C++ golden models.
 
 # Architecture
 
@@ -57,15 +66,19 @@ The result: a chip that loads real GPT-2, LLaMA, Mistral and Qwen2 weights from 
                            AXI4-Lite Host Interface
                           (Control Registers + Start)
                                      |
-                    +----------------v-----------------+
-                    |       Microcode Controller        |
-                    |   Fetch --> Decode --> Dispatch    |
-                    |   + Scoreboard (6 engine slots)   |
-                    |   + Barrier synchronization       |
-                    +--+----+----+----+----+----+------+
-                       |    |    |    |    |    |
-            +----------+    |    |    |    |    +----------+
-            |               |    |    |    |               |
+                              REG_EXEC_MODE
+                             /             \
+                    LLM Mode               Graph Mode
+                    ========               ==========
+    +----------------v-----------------+   +-----------v-----------+
+    |       Microcode Controller        |   |     Graph Pipeline     |
+    |   Fetch --> Decode --> Dispatch    |   | Fetch->Decode->Dispatch|
+    |   + Scoreboard (6 engine slots)   |   | + Tensor Desc Table    |
+    |   + Barrier synchronization       |   | + DMA Shim + EW loops  |
+    +--+----+----+----+----+----+------+   +---+----+----+---------+
+       |    |    |    |    |    |               |    |    |
+       +----+----+----+----+----+-------+------+----+----+
+            |    |    |    |    |        |
     +-------v------+ +------v--+ | +--v------+  +---------v--------+
     |  DMA Engine  | |  GEMM   | | | Softmax |  |   Vec Engine     |
     |  AXI4 Master | | 16x16   | | | 3-pass  |  |  (Add/Mul/Scale) |
@@ -87,17 +100,32 @@ The result: a chip that loads real GPT-2, LLaMA, Mistral and Qwen2 weights from 
                     +-----------------------------+
 ```
 
+The NPU supports two execution modes selected via the `REG_EXEC_MODE` register:
+
+- **LLM Mode** (`EXEC_MODE=0`, default) - The microcode controller fetches 128-bit instructions from SRAM, decodes them, and dispatches to 6 independent engines via a scoreboard. Used for transformer inference (GPT-2, LLaMA, Mistral, Qwen2).
+
+- **Graph Mode** (`EXEC_MODE=1`) - The graph pipeline fetches 128-bit graph ISA instructions from a dedicated program SRAM, looks up tensor descriptors from a 256-entry table, and executes operations serially (one at a time). Used for ONNX model inference (MLP, CNN).
+
+Both modes share all compute engines (GEMM, Softmax, etc.) and SRAM. They are fully isolated - switching modes requires no reset, just writing the `REG_EXEC_MODE` register.
+
 ## NPU
 
-tiny-npu is built to execute one transformer block at a time, layer by layer.
+tiny-npu is built to execute neural network inference layer by layer.
 
-The host CPU orchestrates inference by:
+In **LLM Mode**, the host CPU orchestrates inference by:
 
 1. Loading quantized INT8 weights into external DDR memory
 2. Writing the microcode program for one block into SRAM
 3. Loading per-layer weights from DDR into on-chip SRAM via DMA
 4. Starting the microcode controller which runs the block autonomously
 5. Reading back the output activations and repeating for the next layer
+
+In **Graph Mode**, the ONNX compiler handles all orchestration:
+
+1. Compile an ONNX model to graph ISA instructions, tensor descriptors, and a DDR image
+2. Load the program, descriptors, and DDR image into the NPU
+3. Start the graph pipeline which executes the entire model autonomously
+4. Read back the output from DDR
 
 The NPU itself consists of the following units:
 
@@ -114,16 +142,35 @@ The AXI4-Lite slave interface exposes configuration registers that the host uses
 | `DDR_BASE_WGT` | 0x14 | DDR base address for weights |
 | `MODEL_HIDDEN` | 0x20 | Hidden dimension |
 | `SEQ_LEN` | 0x2C | Current sequence length |
+| `EXEC_MODE` | 0x38 | Execution mode: 0=LLM, 1=Graph |
+| `GRAPH_STATUS` | 0x3C | Graph mode status (read-only) |
+| `GRAPH_PC` | 0x40 | Graph mode program counter (read-only) |
+| `GRAPH_LAST_OP` | 0x44 | Graph mode last opcode (read-only) |
 
-### Microcode Controller
+### Microcode Controller (LLM Mode)
 
-The sequencing brain of the NPU. It fetches 128-bit microcode instructions from SRAM, decodes them into engine-specific commands, and dispatches them to the appropriate hardware engine.
+The sequencing brain of the NPU in LLM Mode. It fetches 128-bit microcode instructions from SRAM, decodes them into engine-specific commands, and dispatches them to the appropriate hardware engine.
 
 A **scoreboard** tracks which of the 6 engines are currently busy, ensuring instructions only dispatch when their target engine is free. A **barrier** instruction forces the controller to stall until all engines complete, which is needed between dependent operations (e.g., wait for GEMM before starting Softmax).
 
+### Graph Pipeline (Graph Mode)
+
+A 3-stage FSM that executes graph ISA instructions serially:
+
+1. **Fetch** - Read 128-bit instructions sequentially from program SRAM, detect `OP_G_END`
+2. **Decode** - Combinational decode into `graph_instr_t` struct (opcode, tensor IDs, flags, immediates)
+3. **Dispatch** - Look up tensor descriptors, program engines (GEMM, DMA) or execute internal loops (element-wise add, ReLU)
+
+The dispatch FSM handles each operation type:
+- **DMA_LOAD/STORE** - Drive the DMA shim with DDR address, SRAM address, and length from the tensor descriptor
+- **GEMM** - Program `gemm_ctrl` with SRAM addresses and shapes from descriptors, support `TRANSPOSE_B`
+- **EW_ADD/MUL/SUB** - Internal 3-cycle/element loop: read A from SRAM, read B from SRAM, compute + write
+- **RELU** - Internal 2-cycle/element loop: read from SRAM, write `max(0, val)`
+- **SOFTMAX** - Program the softmax engine with source/destination from descriptors
+
 ### Dispatcher
 
-Unlike a GPU where a dispatcher distributes threads across cores, the NPU dispatcher routes decoded instructions to the correct engine. Each instruction's opcode determines which engine receives the work. The scoreboard prevents dispatch conflicts, and the barrier instruction provides explicit synchronization.
+Unlike a GPU where a dispatcher distributes threads across cores, the NPU dispatcher routes decoded instructions to the correct engine. Each instruction's opcode determines which engine receives the work. In LLM Mode, the scoreboard prevents dispatch conflicts and barrier instructions provide explicit synchronization. In Graph Mode, execution is fully serialized (one operation at a time).
 
 ## Memory
 
@@ -131,15 +178,15 @@ Unlike a GPU where a dispatcher distributes threads across cores, the NPU dispat
 
 tiny-npu uses two on-chip SRAM banks for all computation:
 
-**SRAM0 (64KB)** - The main workspace. Holds all weights for one transformer block (48KB) plus all intermediate activations (~14KB). The memory map is carefully designed so that 6 weight matrices (Wq, Wk, Wv, Wo, W1, W2) and all intermediate tensors fit simultaneously.
+**SRAM0 (64KB)** - The main workspace. In LLM Mode, it holds all weights for one transformer block (48KB) plus all intermediate activations (~14KB). In Graph Mode, the ONNX compiler allocates SRAM0 space for all tensors using a bump allocator. The memory map is carefully designed so that weights and activations fit simultaneously.
 
-QKV weights use a **head-blocked layout**: each of Wq, Wk, Wv stores 4 contiguous `[64,16]` per-head slices rather than a single `[64,64]` matrix. This lets the microcode address each head's weights directly without reshaping.
+In LLM Mode, QKV weights use a **head-blocked layout**: each of Wq, Wk, Wv stores 4 contiguous `[64,16]` per-head slices rather than a single `[64,64]` matrix. This lets the microcode address each head's weights directly without reshaping.
 
 Per-head attention buffers (Q_H, K_H, V_H, S, P, ATTN_H) are only 256 bytes each and are **reused across heads**. After each head computes its attention output, a `COPY2D` instruction scatters the result into the correct columns of the full-width ATTN concat buffer.
 
 ```
-SRAM0 Memory Map (one transformer block, 4-head attention)
-===========================================================
+SRAM0 Memory Map (LLM Mode - one transformer block, 4-head attention)
+======================================================================
 0x0000 +-----------+
        |  Wq       |  4096B  4x[64,16]  Query weights (head-blocked)
 0x1000 +-----------+
@@ -174,11 +221,13 @@ SRAM0 Memory Map (one transformer block, 4-head attention)
 
 The head-blocked QKV layout keeps total weight size unchanged (3 x 4096B = 12KB for QKV) while enabling direct per-head addressing: head h's query weights are at `Wq + h * 1024`.
 
-**SRAM1 (8KB)** - Auxiliary storage for LayerNorm beta parameters and residual connections. Separated from SRAM0 because the vec engine needs to read from both SRAM0 and SRAM1 simultaneously for residual adds.
+In **Graph Mode**, SRAM0 is allocated dynamically by the ONNX compiler. The SRAM0 mux priority ensures correct arbitration: `graph_dispatch_ew > gemm > softmax > testbench`.
+
+**SRAM1 (8KB)** - Auxiliary storage for LayerNorm beta parameters and residual connections (LLM Mode only). Separated from SRAM0 because the vec engine needs to read from both SRAM0 and SRAM1 simultaneously for residual adds.
 
 ### External Memory (DDR)
 
-Weights for all layers are stored in external DDR memory and loaded one block at a time via DMA. The weight file (`weights.bin`) is ~226KB and contains:
+**LLM Mode**: Weights for all layers are stored in external DDR memory and loaded one block at a time via DMA. The weight file (`weights.bin`) is ~226KB.
 
 | Section | Offset | Size | Description |
 |---------|--------|------|-------------|
@@ -191,9 +240,19 @@ Weights for all layers are stored in external DDR memory and loaded one block at
 | LN_F beta | 214528 | 64B | Final LayerNorm beta |
 | LM head | 214592 | 16KB | Language model head [256][64] |
 
+**Graph Mode**: The ONNX compiler packs all data into a single `ddr_image.bin`:
+
+| Region | Base Address | Max Size | Description |
+|--------|-------------|----------|-------------|
+| Program | 0x00100000 | 64KB | Graph ISA instructions |
+| Descriptors | 0x00200000 | 8KB | Tensor descriptor table (256 x 32B) |
+| Data | 0x00300000 | 1MB | Quantized weights, biases, im2col |
+| IO | 0x00400000 | 64KB | Model input/output tensors |
+| Scratch | 0x00500000 | - | Scratch space |
+
 ## Engines
 
-Each engine is a specialized hardware unit optimized for one class of operation. All engines share access to SRAM0/SRAM1 and report completion back to the scoreboard.
+Each engine is a specialized hardware unit optimized for one class of operation. All engines share access to SRAM0/SRAM1 and report completion back to the scoreboard (LLM Mode) or the graph dispatch FSM (Graph Mode).
 
 ### GEMM Engine (Engine 0)
 
@@ -225,6 +284,8 @@ Weight-Stationary Systolic Array (16x16)
 For matrices larger than 16x16, the **GEMM controller** tiles the computation automatically. A `[16][64] * [64][256]` GEMM is broken into `(1)(4)(16) = 64` tiles of 16x16, with partial sums accumulated across the K dimension.
 
 After accumulation, the **post-processing unit** applies requantization: `result_i8 = clamp(round((acc * scale) >> shift))`. This keeps all intermediate activations in INT8, minimizing SRAM bandwidth requirements.
+
+In Graph Mode, the graph dispatch FSM programs `gemm_ctrl` directly with SRAM addresses and shapes from tensor descriptors. The `TRANSPOSE_B` flag is supported for weight matrices stored in `[N, K]` layout.
 
 ### Softmax Engine (Engine 1)
 
@@ -265,9 +326,48 @@ Transfers data between external DDR memory and on-chip SRAM via AXI4 burst trans
 
 In simulation, DMA transfers are intercepted by a C++ software shim that models the DDR memory, eliminating the need for an actual AXI interconnect.
 
-# ISA
+# Execution Modes
 
-tiny-npu implements a 128-bit fixed-width microcode ISA. Every instruction is the same size and format, which simplifies the hardware decoder at the cost of some encoding efficiency.
+## LLM Mode
+
+LLM Mode is the original execution path, designed for transformer model inference. The host CPU generates microcode programs that orchestrate multi-head attention, FFN, LayerNorm, and residual connections across 4 transformer layers. Supported models:
+
+| Model | Architecture | Special Features |
+|-------|-------------|-----------------|
+| GPT-2 | LayerNorm, MHA, GELU FFN | Standard transformer |
+| LLaMA (MicroLlama) | RMSNorm, GQA, RoPE, SwiGLU | Grouped-query attention, rotary embeddings |
+| Mistral-300M | Same as LLaMA | Identical tensor naming |
+| Qwen2-0.5B | Same as LLaMA + QKV bias | Tied embeddings, bias via VEC_ADD |
+
+All models use INT8 quantization and produce **bit-exact** logits compared to the C++ golden model.
+
+## Graph Mode (ONNX)
+
+Graph Mode is a new execution path that runs compiled ONNX models. Instead of hand-crafted microcode, an **ONNX compiler** automatically lowers model graphs into a sequence of graph ISA instructions with tensor descriptors.
+
+The graph pipeline:
+1. Fetches 128-bit graph ISA instructions from a dedicated program SRAM
+2. Decodes them into opcode + tensor IDs
+3. Looks up tensor descriptors (DDR address, SRAM address, shape, size) from a 256-entry table
+4. Executes each operation serially: DMA transfers, GEMM, element-wise ops, ReLU, softmax
+
+Supported ONNX operations:
+
+| ONNX Op | Graph ISA Lowering |
+|---------|-------------------|
+| `Gemm` | DMA_LOAD weights + input, GEMM, EW_ADD bias |
+| `Relu` | RELU (in-place 2-cycle/element loop) |
+| `Conv` | im2col (pre-materialized in DDR) + GEMM + EW_ADD bias |
+| `Reshape` / `Flatten` | SRAM alias (no hardware op) |
+| `Softmax` | SOFTMAX engine |
+
+Verified models:
+- **MLP**: `[1,32] -> Gemm -> ReLU -> Gemm -> [1,8]` (exact byte match)
+- **CNN**: `[1,1,8,8] -> Conv(3x3,4 filters) -> ReLU -> Flatten -> Gemm -> [1,4]` (exact byte match)
+
+# LLM Mode ISA
+
+tiny-npu's LLM Mode implements a 128-bit fixed-width microcode ISA. Every instruction is the same size and format, which simplifies the hardware decoder at the cost of some encoding efficiency.
 
 ```
 128-bit Microcode Instruction Format
@@ -329,7 +429,7 @@ The fields serve different purposes depending on the opcode:
 | 4 | `CAUSAL_MASK` | Apply causal (lower-triangular) mask |
 | 5 | `ACCUMULATE` | Accumulate with existing values in output buffer |
 
-# Execution
+# LLM Mode Execution
 
 ### Microcode Controller
 
@@ -484,6 +584,133 @@ Both modes produce **bit-exact identical logits** at every step - the KV cache i
 
 In tiny-npu, the KV cache is implemented as a C++ software shim that intercepts `KV_APPEND` and `KV_READ` instructions from the RTL. The hardware issues these instructions through the same scoreboard slot as DMA (Engine 5), with mutual exclusion guards. This approach lets us verify the full KV-cache dataflow without requiring large on-chip SRAM for the cache itself.
 
+# Graph Mode ISA
+
+Graph Mode uses a separate 128-bit instruction format optimized for tensor operations with 8-bit tensor IDs (referencing entries in the tensor descriptor table):
+
+```
+128-bit Graph ISA Instruction Format
+======================================
+
+  127             96 95              64 63     48 47   40 39   32
+  +----------------+------------------+---------+------+------+
+  |     imm2       |       imm1       |  imm0   | src2 | src1 |
+  |   (32 bits)    |    (32 bits)     |(16 bits)|(8bit)|(8bit)|
+  +----------------+------------------+---------+------+------+
+
+  31   24 23   16 15    8 7       0
+  +------+------+-------+---------+
+  | src0 |  dst | flags | opcode  |
+  |(8bit)|(8bit)|(8 bit)| (8 bit) |
+  +------+------+-------+---------+
+```
+
+### Graph Opcodes
+
+| Code | Mnemonic | Description |
+|------|----------|-------------|
+| 0x00 | `OP_G_END` | End of program (zeros = END for safety) |
+| 0x01 | `OP_G_BARRIER` | No-op in serialized mode |
+| 0x10 | `OP_G_DMA_LOAD` | Load tensor from DDR to SRAM (src0 = tensor ID) |
+| 0x11 | `OP_G_DMA_STORE` | Store tensor from SRAM to DDR (src0 = tensor ID) |
+| 0x12 | `OP_G_DMA_STRIDED` | Strided DMA (for im2col patterns) |
+| 0x20 | `OP_G_GEMM` | Matrix multiply (src0=A, src1=B, dst=C tensor IDs) |
+| 0x30 | `OP_G_EW_ADD` | Element-wise add with saturation |
+| 0x31 | `OP_G_EW_MUL` | Element-wise multiply (Q7 fixed-point) |
+| 0x32 | `OP_G_EW_SUB` | Element-wise subtract with saturation |
+| 0x38 | `OP_G_RELU` | ReLU activation (in-place capable) |
+| 0x40 | `OP_G_SOFTMAX` | Softmax via the softmax engine |
+
+### GEMM Flags (Graph Mode)
+
+| Bit | Name | Description |
+|-----|------|-------------|
+| 0 | `TRANSPOSE_B` | Weight stored as [N,K], transpose during multiply |
+| 2 | `REQUANT` | Apply requantization: imm0 encodes scale (low byte) and shift (high byte) |
+
+# Graph Mode Execution
+
+## Graph Pipeline
+
+The graph pipeline is a 3-module hierarchy:
+
+```
+  graph_top
+  +-- graph_fetch     Sequential instruction fetch from program SRAM
+  +-- graph_decode    Combinational 128-bit -> graph_instr_t decode
+  +-- graph_dispatch  Main FSM: descriptor lookup -> engine control -> EW loops
+```
+
+The dispatch FSM follows this flow for each instruction:
+
+```
+GD_IDLE -> GD_FETCH_WAIT -> GD_DECODE -> GD_TDESC0 -> GD_TDESC1 -> GD_TDESC2
+  -> GD_EXEC_xxx -> (GD_WAIT_DONE or EW loop) -> GD_NEXT -> GD_FETCH_WAIT ...
+  -> GD_DONE (on OP_G_END)
+```
+
+Three cycles are spent looking up tensor descriptors (src0, src1, dst) from the combinational tensor table. Then the FSM branches based on opcode:
+
+- **DMA**: Drives the DMA shim with addresses/length from the descriptor, waits for `dma_done`
+- **GEMM**: Programs `gemm_ctrl` with SRAM addresses and M/N/K from descriptors, waits for `gm_done`
+- **EW_ADD/MUL/SUB**: Runs an internal 3-state loop (RD_A -> RD_B -> COMPUTE) for each element
+- **RELU**: Runs an internal 2-state loop (RD -> WR) for each element
+- **SOFTMAX**: Programs the softmax engine, waits for `sm_done`
+
+Error detection halts the FSM on bad opcodes or GEMM shape mismatches (e.g., A's K != B's inner dimension, accounting for `TRANSPOSE_B`).
+
+## Tensor Descriptor Table
+
+A 256-entry register array where each entry is 256 bits (32 bytes):
+
+```
+Tensor Descriptor (256-bit = 32 bytes)
+=======================================
+Bits [31:0]     ddr_addr     DDR byte address
+Bits [47:32]    sram_addr    SRAM0 byte address
+Bits [63:48]    size_bytes   Total tensor size in bytes
+Bits [79:64]    shape0       Dimension 0 (e.g., M or batch)
+Bits [95:80]    shape1       Dimension 1 (e.g., N or channels)
+Bits [111:96]   shape2       Dimension 2
+Bits [127:112]  shape3       Dimension 3
+Bits [135:128]  rank         Number of dimensions
+Bits [143:136]  dtype        Data type (0 = INT8)
+Bits [151:144]  flags        Tensor flags
+Bits [255:152]  reserved     Padding
+```
+
+The descriptor table supports 3 simultaneous combinational reads (for src0, src1, dst) and 1 clocked write (for loading descriptors from the testbench/host).
+
+## ONNX Compiler
+
+The ONNX compiler (`python/onnx_compiler/compile.py`) transforms an ONNX model into NPU-ready artifacts:
+
+```
+  ONNX Model (.onnx)
+        |
+   Shape Inference
+        |
+   INT8 Quantization (per-tensor symmetric)
+        |
+   DDR Allocation (64B-aligned, weights + biases + im2col)
+        |
+   SRAM0 Allocation (bump allocator, must fit in 64KB)
+        |
+   Tensor Descriptor Table (256 entries x 32B)
+        |
+   Op Lowering (Gemm -> DMA+GEMM+EW_ADD, Conv -> im2col+GEMM+EW_ADD, etc.)
+        |
+   Golden Computation (INT8 GEMM with INT32 acc + requant + saturating add)
+        |
+   Output: program.bin, tdesc.bin, ddr_image.bin, golden.bin, manifest.json
+```
+
+Key compiler decisions:
+- **Requantization**: `shift = ceil(log2(K))`, `scale = 1`. Rounding: `(acc + (1 << (shift-1))) >> shift`
+- **Bias handling**: Bias is added AFTER requantization via a separate `EW_ADD` instruction (matches RTL pipeline order)
+- **Conv lowering**: im2col is pre-materialized by the compiler in DDR, then loaded to SRAM and multiplied via GEMM
+- **SRAM tracking**: The compiler tracks which tensors are "live" in SRAM to avoid redundant DMA loads
+
 # Inference Demo
 
 tiny-npu runs real GPT-2 inference, not a toy example. Here's what happens end-to-end:
@@ -579,8 +806,11 @@ This approach is tolerant of small LayerNorm rounding differences (~1-2 values b
 sudo apt update
 sudo apt install -y build-essential cmake python3 python3-pip verilator
 
-# Python dependencies (only needed for inference demo)
+# Python dependencies (only needed for inference demos)
 pip3 install numpy transformers huggingface_hub safetensors
+
+# Additional dependency for ONNX Graph Mode
+pip3 install onnx
 ```
 
 ### Build
@@ -592,20 +822,22 @@ cmake ..
 cmake --build . -j$(nproc)
 ```
 
-This builds 8 simulation targets:
+This builds 10 simulation targets:
 
-| # | Target | Description |
-|---|--------|-------------|
-| 1 | `npu_sim` | Control plane smoke test (AXI registers, reset) |
-| 2 | `engine_sim` | Individual engine compute tests (6 tests) |
-| 3 | `integration_sim` | Attention head integration |
-| 4 | `gpt2_block_sim` | Full transformer block (23 HW GEMMs, 4-head attention) |
-| 5 | `demo_infer` | End-to-end GPT-2 inference demo |
-| 6 | `kv_cache_sim` | KV cache correctness (bit-exact vs full-recompute) |
-| 7 | `llama_block_sim` | Full LLaMA transformer block (GQA, RoPE, SwiGLU) |
-| 8 | `llama_demo_infer` | End-to-end LLaMA inference demo |
+| # | Target | Mode | Description |
+|---|--------|------|-------------|
+| 1 | `npu_sim` | LLM | Control plane smoke test (AXI registers, reset) |
+| 2 | `engine_sim` | LLM | Individual engine compute tests (6 tests) |
+| 3 | `integration_sim` | LLM | Attention head integration |
+| 4 | `gpt2_block_sim` | LLM | Full transformer block (23 HW GEMMs, 4-head attention) |
+| 5 | `demo_infer` | LLM | End-to-end GPT-2 inference demo |
+| 6 | `kv_cache_sim` | LLM | KV cache correctness (bit-exact vs full-recompute) |
+| 7 | `llama_block_sim` | LLM | Full LLaMA transformer block (GQA, RoPE, SwiGLU) |
+| 8 | `llama_demo_infer` | LLM | End-to-end LLaMA inference demo |
+| 9 | `onnx_smoke_sim` | Graph | MLP smoke test (Gemm -> ReLU -> Gemm, exact byte match) |
+| 10 | `onnx_cnn_smoke_sim` | Graph | CNN smoke test (Conv -> ReLU -> Flatten -> Gemm, exact byte match) |
 
-### Run Unit Tests
+### Run Unit Tests (LLM Mode)
 
 Targets 1-4 use built-in test vectors and require no external data:
 
@@ -727,6 +959,68 @@ Expected output:
 
 The NPU hardware produces **bit-exact** logits compared to the C++ golden model (`logit_max_err=0`).
 
+### Run ONNX Graph Mode Tests
+
+Graph Mode tests require generating an ONNX model and compiling it first:
+
+**MLP Smoke Test** (Gemm -> ReLU -> Gemm):
+
+```bash
+cd npu
+
+# Generate the MLP ONNX model
+python3 python/onnx_compiler/gen_mlp_onnx.py
+
+# Compile to graph artifacts
+python3 python/onnx_compiler/compile.py \
+    --model models/mlp_32_16_8.onnx \
+    --outdir sim/verilator/build/graph
+
+# Run the smoke test
+cd sim/verilator/build
+./onnx_smoke_sim --datadir graph
+```
+
+Expected output:
+```
+=== ONNX Graph Mode Smoke Test ===
+  Loaded DDR image: 3146752 bytes
+  Loading 14 instructions from graph/program.bin
+  Loading 10 tensor descriptors from graph/tdesc.bin
+  Starting graph execution (14 instructions)...
+  DMA LOAD: ddr=0x00300000 sram=0x0020 len=512
+  DMA LOAD: ddr=0x00300300 sram=0x0000 len=32
+  ...
+  Graph execution DONE at cycle 2517
+PASS: All 8 bytes match golden!
+```
+
+**CNN Smoke Test** (Conv -> ReLU -> Flatten -> Gemm):
+
+```bash
+cd npu
+
+# Generate the CNN ONNX model
+python3 python/onnx_compiler/gen_cnn_onnx.py
+
+# Compile to graph artifacts
+python3 python/onnx_compiler/compile.py \
+    --model models/conv1x_mini.onnx \
+    --outdir sim/verilator/build/graph_cnn
+
+# Run the smoke test
+cd sim/verilator/build
+./onnx_cnn_smoke_sim --datadir graph_cnn
+```
+
+Expected output:
+```
+=== ONNX Graph Mode CNN Smoke Test ===
+  ...
+  Graph execution DONE at cycle 4781
+PASS: All 4 bytes match golden!
+```
+
 ### Run KV Cache Correctness Test
 
 Verifies that KV-cached decode produces bit-exact results vs full-recompute:
@@ -753,13 +1047,17 @@ Expected output:
 ```bash
 cd npu/sim/verilator/build
 
-# All unit tests
+# LLM Mode unit tests
 ./npu_sim && ./engine_sim && ./integration_sim && ./gpt2_block_sim
 
-# KV cache test + inference demo (needs weights.bin from Python pipeline)
+# KV cache + inference demos (needs weights.bin from Python pipeline)
 ./kv_cache_sim --datadir demo_data
 ./demo_infer --datadir demo_data --max-tokens 10
 ./demo_infer --datadir demo_data --max-tokens 10 --kv-cache
+
+# Graph Mode tests (needs ONNX model compilation)
+./onnx_smoke_sim --datadir graph
+./onnx_cnn_smoke_sim --datadir graph_cnn
 ```
 
 ### Debug with Waveforms
@@ -818,7 +1116,11 @@ Improvements I want to make to the design:
 - [ ] Scale to full GPT-2 dimensions (hidden=768) with weight streaming
 - [ ] Add FP16 accumulation mode for better dynamic range
 - [ ] FPGA synthesis and on-board demo (Xilinx Zynq / Artix-7)
+- [ ] Graph Mode: parallel engine execution (pipeline DMA with compute)
+- [ ] Graph Mode: more ONNX ops (MaxPool, BatchNorm, residual add)
+- [ ] Graph Mode: automatic SRAM tiling for models exceeding 64KB
 - [x] Support for more model architectures (LLaMA, Mistral, Qwen2 with GQA, RoPE, QKV bias)
+- [x] Graph Mode v1: ONNX compilation and execution (MLP, CNN with im2col)
 
 # Repository Structure
 
@@ -826,22 +1128,29 @@ Improvements I want to make to the design:
 npu/
   rtl/
     pkg/                     SystemVerilog packages
-      npu_pkg.sv               Engine IDs, data widths, utility functions
-      isa_pkg.sv               128-bit instruction format, opcodes
+      npu_pkg.sv               Engine IDs, data widths, exec mode constants
+      isa_pkg.sv               128-bit instruction format, opcodes (LLM Mode)
       fixed_pkg.sv             Fixed-point arithmetic helpers
       kv_pkg.sv                KV cache instruction field documentation
-    top.sv                   Full top-level (AXI bus + DMA + control)
+    top.sv                   Full top-level (AXI bus + DMA + control + mode mux)
     bus/                     AXI4 / AXI4-Lite interfaces
       axi_types.sv             Type definitions
-      axi_lite_regs.sv         Host control register file
+      axi_lite_regs.sv         Host control register file (incl. EXEC_MODE, graph status)
       axi_dma_rd.sv            AXI DMA read engine
       axi_dma_wr.sv            AXI DMA write engine
-    ctrl/                    Microcode controller
+    ctrl/                    Microcode controller (LLM Mode)
       ucode_fetch.sv           Instruction fetch unit
       ucode_decode.sv          Decode + dispatch to engines
       scoreboard.sv            6-engine busy tracking
       barrier.sv               Barrier synchronization
       addr_gen.sv              Address generation
+    graph/                   Graph pipeline (Graph Mode)
+      graph_isa_pkg.sv         Graph ISA opcodes, instruction/descriptor structs
+      graph_fetch.sv           Sequential instruction fetch from program SRAM
+      graph_decode.sv          Combinational 128-bit -> graph_instr_t decode
+      graph_dispatch.sv        Main FSM: descriptor lookup, engine control, EW loops
+      graph_top.sv             Wrapper: fetch + decode + dispatch
+      tensor_table.sv          256-entry tensor descriptor register array
     mem/                     Memory subsystem
       sram_dp.sv               Dual-port SRAM primitive
       banked_sram.sv           Multi-bank SRAM wrapper
@@ -867,11 +1176,15 @@ npu/
       reduce_max.sv            Tree-based max reduction
       reduce_sum.sv            Tree-based sum reduction
       mean_var_engine.sv       Mean and variance computation
+  include/                   Shared C++ headers
+    graph_isa.h                C++ mirror of graph_isa_pkg (encode, decode, structs)
+    ddr_graph.h                DDR memory map constants for Graph Mode
   sim/
     verilator/               Verilator simulation environment
-      CMakeLists.txt           Build system (8 targets)
+      CMakeLists.txt           Build system (10 targets)
       gpt2_block_top.sv        GPT-2 testbench top (SRAMs + ucode + engines)
       llama_block_top.sv       LLaMA testbench top (SRAMs + ucode + engines)
+      onnx_sim_top.sv          Graph Mode testbench top (SRAMs + graph pipeline + engines)
       engine_tb_top.sv         Engine-level testbench wrapper
       integration_top.sv       Integration testbench wrapper
       tb_top.cpp               Target 1: Control plane smoke test
@@ -882,6 +1195,8 @@ npu/
       tb_kv_cache_sim.cpp      Target 6: KV cache correctness test
       tb_llama_block.cpp       Target 7: Full LLaMA transformer block test
       tb_llama_demo_infer.cpp  Target 8: LLaMA inference demo
+      tb_onnx_smoke.cpp        Target 9: MLP smoke test (Graph Mode)
+      tb_onnx_cnn_smoke.cpp    Target 10: CNN smoke test (Graph Mode)
       run_demo.sh              Automated demo runner script
   python/
     golden/                  Python golden reference models
@@ -909,9 +1224,17 @@ npu/
       qwen_gen_weights_hf.py   Generate LLaMA weights from HuggingFace Qwen2-0.5B (QKV bias)
       make_lut.py              LUT initialization file generator
       ucode_asm.py             Microcode assembler
+    onnx_compiler/           ONNX -> Graph Mode compiler
+      __init__.py              Package init
+      compile.py               Main compiler: ONNX -> program.bin + tdesc.bin + ddr_image.bin
+      gen_mlp_onnx.py          Generate MLP test model (32 -> 16 -> 8)
+      gen_cnn_onnx.py          Generate CNN test model (Conv3x3 -> ReLU -> FC)
     tests/
       test_end2end.py          Python-level end-to-end tests
     requirements.txt           Python dependencies
+  models/                    Generated ONNX models (by gen_*.py scripts)
+    mlp_32_16_8.onnx           MLP test model
+    conv1x_mini.onnx           CNN test model
   README.md                  This file
 ```
 
@@ -927,6 +1250,7 @@ npu/
    add_files -fileset sources_1 [glob rtl/ctrl/*.sv]
    add_files -fileset sources_1 [glob rtl/gemm/*.sv]
    add_files -fileset sources_1 [glob rtl/ops/*.sv]
+   add_files -fileset sources_1 [glob rtl/graph/*.sv]
    add_files -fileset sources_1 rtl/top.sv
    ```
 

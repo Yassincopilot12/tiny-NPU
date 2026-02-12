@@ -88,6 +88,16 @@ package npu_pkg;
     parameter logic [AXIL_ADDR_W-1:0] REG_TOKEN_IDX     = 32'h30;
     parameter logic [AXIL_ADDR_W-1:0] REG_DEBUG_CTRL    = 32'h34;
 
+    // Graph Mode registers
+    parameter logic [AXIL_ADDR_W-1:0] REG_EXEC_MODE     = 32'h38;
+    parameter logic [AXIL_ADDR_W-1:0] REG_GRAPH_STATUS  = 32'h3C;
+    parameter logic [AXIL_ADDR_W-1:0] REG_GRAPH_PC      = 32'h40;
+    parameter logic [AXIL_ADDR_W-1:0] REG_GRAPH_LAST_OP = 32'h44;
+
+    // Execution mode constants
+    parameter int EXEC_MODE_LEGACY = 0;
+    parameter int EXEC_MODE_GRAPH  = 1;
+
     // CTRL register bits
     parameter int CTRL_START      = 0;
     parameter int CTRL_SOFT_RESET = 1;

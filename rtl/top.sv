@@ -95,6 +95,18 @@ module top
     wire [31:0] reg_seq_len;
     wire [31:0] reg_token_idx;
     wire [31:0] reg_debug_ctrl;
+    wire [31:0] reg_exec_mode;
+
+    // Graph mode status (tied to 0 until graph_top is instantiated)
+    logic [31:0] graph_status_w;
+    logic [31:0] graph_pc_w;
+    logic [31:0] graph_last_op_w;
+    assign graph_status_w  = 32'd0;
+    assign graph_pc_w      = 32'd0;
+    assign graph_last_op_w = 32'd0;
+
+    // Exec mode convenience
+    wire graph_mode = (reg_exec_mode[0] == 1'b1);
 
     logic npu_done;
     logic npu_busy;
@@ -172,7 +184,11 @@ module top
     assign engine_done_vec[4] = vec_done;
     assign engine_done_vec[5] = dma_rd_done | dma_wr_done;
 
-    assign npu_busy = |engine_busy;
+    // In graph mode, legacy pipeline is idle; graph_top drives done/busy/error
+    // In legacy mode, legacy pipeline is active
+    wire legacy_start_pulse = start_pulse && !graph_mode;
+
+    assign npu_busy = graph_mode ? 1'b0 : |engine_busy;
     assign npu_error = 1'b0; // TODO: aggregate errors
 
     // Latch done signal so it persists until next START
@@ -180,9 +196,9 @@ module top
     always_ff @(posedge clk or negedge rst_int_n) begin
         if (!rst_int_n)
             npu_done_latch <= 1'b0;
-        else if (start_pulse)
+        else if (legacy_start_pulse)
             npu_done_latch <= 1'b0;
-        else if (program_end || fetch_done)
+        else if (!graph_mode && (program_end || fetch_done))
             npu_done_latch <= 1'b1;
     end
     assign npu_done = npu_done_latch;
@@ -227,6 +243,10 @@ module top
         .seq_len_o        (reg_seq_len),
         .token_idx_o      (reg_token_idx),
         .debug_ctrl_o     (reg_debug_ctrl),
+        .exec_mode_o      (reg_exec_mode),
+        .graph_status_i   (graph_status_w),
+        .graph_pc_i       (graph_pc_w),
+        .graph_last_op_i  (graph_last_op_w),
         .start_pulse_o    (start_pulse),
         .soft_reset_o     (soft_reset)
     );
@@ -344,7 +364,7 @@ module top
     ) u_fetch (
         .clk            (clk),
         .rst_n          (rst_int_n),
-        .start          (start_pulse),
+        .start          (legacy_start_pulse),
         .stop           (1'b0),
         .ucode_base_addr({P_SRAM_ADDR_W{1'b0}}),
         .ucode_len      (reg_ucode_len[P_SRAM_ADDR_W-1:0]),

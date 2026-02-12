@@ -70,6 +70,14 @@ module axi_lite_regs
     output logic [31:0]               seq_len_o,
     output logic [31:0]               token_idx_o,
     output logic [31:0]               debug_ctrl_o,
+    output logic [31:0]               exec_mode_o,
+
+    // -----------------------------------------------------------------------
+    //  Graph Mode status inputs (read-only)
+    // -----------------------------------------------------------------------
+    input  logic [31:0]               graph_status_i,
+    input  logic [31:0]               graph_pc_i,
+    input  logic [31:0]               graph_last_op_i,
 
     // -----------------------------------------------------------------------
     //  Derived control outputs
@@ -94,6 +102,7 @@ module axi_lite_regs
     logic [31:0] reg_seq_len;
     logic [31:0] reg_token_idx;
     logic [31:0] reg_debug_ctrl;
+    logic [31:0] reg_exec_mode;
 
     // Soft-reset hold counter (holds reset for 4 cycles)
     logic [2:0]  soft_reset_cnt;
@@ -210,6 +219,7 @@ module axi_lite_regs
             reg_seq_len        <= 32'd0;
             reg_token_idx      <= 32'd0;
             reg_debug_ctrl     <= 32'd0;
+            reg_exec_mode      <= 32'd0;
             soft_reset_cnt     <= 3'd0;
         end else begin
             // ----------------------------------------------------------
@@ -254,6 +264,8 @@ module axi_lite_regs
                     REG_SEQ_LEN[7:0]:        reg_seq_len        <= strb_write(reg_seq_len,        wr_data, wr_strb);
                     REG_TOKEN_IDX[7:0]:      reg_token_idx      <= strb_write(reg_token_idx,      wr_data, wr_strb);
                     REG_DEBUG_CTRL[7:0]:     reg_debug_ctrl     <= strb_write(reg_debug_ctrl,     wr_data, wr_strb);
+                    REG_EXEC_MODE[7:0]:      reg_exec_mode      <= strb_write(reg_exec_mode,      wr_data, wr_strb);
+                    // REG_GRAPH_STATUS, REG_GRAPH_PC, REG_GRAPH_LAST_OP are read-only
                     default: ;  // unmapped -- silently ignore
                 endcase
             end
@@ -308,6 +320,10 @@ module axi_lite_regs
                     REG_SEQ_LEN[7:0]:        s_axil_rdata <= reg_seq_len;
                     REG_TOKEN_IDX[7:0]:      s_axil_rdata <= reg_token_idx;
                     REG_DEBUG_CTRL[7:0]:     s_axil_rdata <= reg_debug_ctrl;
+                    REG_EXEC_MODE[7:0]:      s_axil_rdata <= reg_exec_mode;
+                    REG_GRAPH_STATUS[7:0]:   s_axil_rdata <= graph_status_i;
+                    REG_GRAPH_PC[7:0]:       s_axil_rdata <= graph_pc_i;
+                    REG_GRAPH_LAST_OP[7:0]:  s_axil_rdata <= graph_last_op_i;
                     default:                 s_axil_rdata <= 32'hDEAD_BEEF;
                 endcase
             end
@@ -335,6 +351,7 @@ module axi_lite_regs
     assign seq_len_o        = reg_seq_len;
     assign token_idx_o      = reg_token_idx;
     assign debug_ctrl_o     = reg_debug_ctrl;
+    assign exec_mode_o      = reg_exec_mode;
 
     // START is a single-cycle pulse derived from the register bit
     assign start_pulse_o = reg_ctrl[CTRL_START];
