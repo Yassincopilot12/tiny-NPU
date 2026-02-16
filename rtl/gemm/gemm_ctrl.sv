@@ -5,12 +5,14 @@
 // Supports M/N/K tiling for dimensions exceeding the 16x16 systolic array.
 // K-tiling uses an external ACC SRAM to accumulate int32 partial sums
 // across K-tiles before final requantization.
+// Supports INT8 and FP16 data types.
 // =============================================================================
 `default_nettype none
 
 module gemm_ctrl
     import npu_pkg::*;
     import isa_pkg::*;
+    import fp16_utils_pkg::*;
 #(
     parameter int ARRAY_M     = 16,
     parameter int ARRAY_N     = 16,
@@ -31,6 +33,7 @@ module gemm_ctrl
     input  wire  [15:0]                  cmd_K,
     input  wire  [7:0]                   cmd_flags,
     input  wire  [15:0]                  cmd_imm,
+    input  wire                          cmd_dtype,    // 0=INT8, 1=FP16
 
     // SRAM read port (one byte per cycle, 1-cycle read latency)
     output logic                         sram_rd_en,
@@ -56,6 +59,11 @@ module gemm_ctrl
     output logic signed [DATA_W-1:0]     sa_a_col [ARRAY_M],
     output logic signed [DATA_W-1:0]     sa_b_row [ARRAY_N],
     input  wire  signed [ACC_W-1:0]      sa_acc   [ARRAY_M][ARRAY_N],
+
+    // FP16 systolic array interface
+    output logic                         dtype_fp16,
+    output logic signed [15:0]           sa_a_col_fp16 [ARRAY_M],
+    output logic signed [15:0]           sa_b_row_fp16 [ARRAY_N],
 
     // Status
     output logic                         busy,
@@ -110,6 +118,16 @@ module gemm_ctrl
     logic signed [DATA_W-1:0] buf_a [ARRAY_M][ARRAY_N];
     logic signed [DATA_W-1:0] buf_b [ARRAY_N][ARRAY_N];
 
+    // FP16 buffers
+    logic signed [15:0] buf_a_fp16 [ARRAY_M][ARRAY_N];
+    logic signed [15:0] buf_b_fp16 [ARRAY_N][ARRAY_N];
+
+    // FP16 mode register
+    logic        r_dtype;    // 0=INT8, 1=FP16
+    logic        load_byte;  // 0=low byte, 1=high byte (FP16 mode)
+    logic        store_byte; // 0=low byte, 1=high byte (FP16 store)
+    logic [7:0]  lo_byte;    // temp storage for low byte during FP16 load
+
     // =========================================================================
     // Counters
     // =========================================================================
@@ -157,13 +175,23 @@ module gemm_ctrl
             end
 
             ST_LOAD_A: begin
-                if (load_phase && load_row == m_eff - 5'd1 && load_col == k_eff - 5'd1)
-                    state_next = ST_LOAD_B;
+                if (r_dtype) begin
+                    if (load_phase && load_byte && load_row == m_eff - 5'd1 && load_col == k_eff - 5'd1)
+                        state_next = ST_LOAD_B;
+                end else begin
+                    if (load_phase && load_row == m_eff - 5'd1 && load_col == k_eff - 5'd1)
+                        state_next = ST_LOAD_B;
+                end
             end
 
             ST_LOAD_B: begin
-                if (load_phase && load_row == k_eff - 5'd1 && load_col == n_eff - 5'd1)
-                    state_next = ST_CLEAR;
+                if (r_dtype) begin
+                    if (load_phase && load_byte && load_row == k_eff - 5'd1 && load_col == n_eff - 5'd1)
+                        state_next = ST_CLEAR;
+                end else begin
+                    if (load_phase && load_row == k_eff - 5'd1 && load_col == n_eff - 5'd1)
+                        state_next = ST_CLEAR;
+                end
             end
 
             ST_CLEAR: begin
@@ -178,9 +206,15 @@ module gemm_ctrl
             ST_STORE: begin
                 // Determine when store is complete based on K-tiling mode
                 if (!multi_k) begin
-                    // Single K-tile: 1 cycle per element
-                    if (store_row == m_eff - 5'd1 && store_col == n_eff - 5'd1)
-                        state_next = ST_TILE_NEXT;
+                    if (r_dtype) begin
+                        // FP16 single-K: 2 bytes per element
+                        if (store_byte && store_row == m_eff - 5'd1 && store_col == n_eff - 5'd1)
+                            state_next = ST_TILE_NEXT;
+                    end else begin
+                        // INT8 single K-tile: 1 cycle per element
+                        if (store_row == m_eff - 5'd1 && store_col == n_eff - 5'd1)
+                            state_next = ST_TILE_NEXT;
+                    end
                 end else begin
                     // Multi-K-tile: 2 cycles per element (phase 0: read ACC, phase 1: write)
                     if (first_k_tile) begin
@@ -189,8 +223,20 @@ module gemm_ctrl
                             state_next = ST_TILE_NEXT;
                     end else begin
                         // Middle/last K-tiles: 2 phases (read ACC, then accumulate+write)
-                        if (store_phase && store_row == m_eff - 5'd1 && store_col == n_eff - 5'd1)
-                            state_next = ST_TILE_NEXT;
+                        if (r_dtype) begin
+                            if (last_k_tile) begin
+                                // Last K-tile FP16: need store_phase done + store_byte done
+                                if (store_phase && store_byte && store_row == m_eff - 5'd1 && store_col == n_eff - 5'd1)
+                                    state_next = ST_TILE_NEXT;
+                            end else begin
+                                // Middle K-tile: just ACC write, no byte splitting
+                                if (store_phase && store_row == m_eff - 5'd1 && store_col == n_eff - 5'd1)
+                                    state_next = ST_TILE_NEXT;
+                            end
+                        end else begin
+                            if (store_phase && store_row == m_eff - 5'd1 && store_col == n_eff - 5'd1)
+                                state_next = ST_TILE_NEXT;
+                        end
                     end
                 end
             end
@@ -245,6 +291,10 @@ module gemm_ctrl
         for (int i = 0; i < ARRAY_M; i++) sa_a_col[i] = '0;
         for (int j = 0; j < ARRAY_N; j++) sa_b_row[j] = '0;
 
+        dtype_fp16 = r_dtype;
+        for (int i = 0; i < ARRAY_M; i++) sa_a_col_fp16[i] = '0;
+        for (int j = 0; j < ARRAY_N; j++) sa_b_row_fp16[j] = '0;
+
         case (state)
             ST_IDLE: begin
                 busy = 1'b0;
@@ -253,17 +303,27 @@ module gemm_ctrl
             ST_LOAD_A: begin
                 if (!load_phase) begin
                     sram_rd_en   = 1'b1;
-                    sram_rd_addr = a_tile_base + {11'b0, load_row} * r_K + {11'b0, load_col};
+                    if (r_dtype)
+                        sram_rd_addr = a_tile_base + {11'b0, load_row} * (r_K << 1) + ({11'b0, load_col} << 1) + {15'b0, load_byte};
+                    else
+                        sram_rd_addr = a_tile_base + {11'b0, load_row} * r_K + {11'b0, load_col};
                 end
             end
 
             ST_LOAD_B: begin
                 if (!load_phase) begin
                     sram_rd_en = 1'b1;
-                    if (r_transpose_b)
-                        sram_rd_addr = b_tile_base + {11'b0, load_col} * r_K + {11'b0, load_row};
-                    else
-                        sram_rd_addr = b_tile_base + {11'b0, load_row} * r_N + {11'b0, load_col};
+                    if (r_dtype) begin
+                        if (r_transpose_b)
+                            sram_rd_addr = b_tile_base + {11'b0, load_col} * (r_K << 1) + ({11'b0, load_row} << 1) + {15'b0, load_byte};
+                        else
+                            sram_rd_addr = b_tile_base + {11'b0, load_row} * (r_N << 1) + ({11'b0, load_col} << 1) + {15'b0, load_byte};
+                    end else begin
+                        if (r_transpose_b)
+                            sram_rd_addr = b_tile_base + {11'b0, load_col} * r_K + {11'b0, load_row};
+                        else
+                            sram_rd_addr = b_tile_base + {11'b0, load_row} * r_N + {11'b0, load_col};
+                    end
                 end
             end
 
@@ -273,6 +333,7 @@ module gemm_ctrl
 
             ST_STREAM: begin
                 sa_en = 1'b1;
+                // INT8 streaming
                 for (int i = 0; i < ARRAY_M; i++) begin
                     automatic int idx_a = int'(stream_cnt) - i;
                     if (idx_a >= 0 && idx_a < int'(k_eff) && i < int'(m_eff))
@@ -287,18 +348,41 @@ module gemm_ctrl
                     else
                         sa_b_row[j] = '0;
                 end
+                // FP16 streaming (parallel)
+                for (int i = 0; i < ARRAY_M; i++) begin
+                    automatic int idx_a = int'(stream_cnt) - i;
+                    if (idx_a >= 0 && idx_a < int'(k_eff) && i < int'(m_eff))
+                        sa_a_col_fp16[i] = buf_a_fp16[i][idx_a[3:0]];
+                    else
+                        sa_a_col_fp16[i] = '0;
+                end
+                for (int j = 0; j < ARRAY_N; j++) begin
+                    automatic int idx_b = int'(stream_cnt) - j;
+                    if (idx_b >= 0 && idx_b < int'(k_eff) && j < int'(n_eff))
+                        sa_b_row_fp16[j] = buf_b_fp16[idx_b[3:0]][j];
+                    else
+                        sa_b_row_fp16[j] = '0;
+                end
             end
 
             ST_STORE: begin
                 if (!multi_k) begin
-                    // === Single K-tile: requantize directly to output SRAM ===
+                    // === Single K-tile ===
                     sram_wr_en   = 1'b1;
-                    sram_wr_addr = c_tile_base + {11'b0, store_row} * r_N + {11'b0, store_col};
-                    if (r_do_requant)
-                        sram_wr_data = requantize(sa_acc[store_row[3:0]][store_col[3:0]],
-                                                  r_scale, r_shift);
-                    else
-                        sram_wr_data = saturate_i8(sa_acc[store_row[3:0]][store_col[3:0]]);
+                    if (r_dtype) begin
+                        // FP16: convert FP32 acc to FP16, write 2 bytes
+                        automatic logic [15:0] fp16_val = fp32_to_fp16(sa_acc[store_row[3:0]][store_col[3:0]]);
+                        sram_wr_addr = c_tile_base + ({11'b0, store_row} * (r_N << 1)) + ({11'b0, store_col} << 1) + {15'b0, store_byte};
+                        sram_wr_data = store_byte ? fp16_val[15:8] : fp16_val[7:0];
+                    end else begin
+                        // INT8: requantize directly to output SRAM
+                        sram_wr_addr = c_tile_base + {11'b0, store_row} * r_N + {11'b0, store_col};
+                        if (r_do_requant)
+                            sram_wr_data = requantize(sa_acc[store_row[3:0]][store_col[3:0]],
+                                                      r_scale, r_shift);
+                        else
+                            sram_wr_data = saturate_i8(sa_acc[store_row[3:0]][store_col[3:0]]);
+                    end
                 end else if (first_k_tile) begin
                     // === First K-tile of multi-K: write partial sum to ACC SRAM ===
                     acc_wr_en   = 1'b1;
@@ -313,16 +397,25 @@ module gemm_ctrl
                     end else begin
                         // Phase 1: accumulate and write back
                         if (last_k_tile) begin
-                            // Last K-tile: accumulate, requantize, write to output SRAM
-                            sram_wr_en   = 1'b1;
-                            sram_wr_addr = c_tile_base + {11'b0, store_row} * r_N + {11'b0, store_col};
-                            if (r_do_requant)
-                                sram_wr_data = requantize(
-                                    acc_rd_data + sa_acc[store_row[3:0]][store_col[3:0]],
-                                    r_scale, r_shift);
-                            else
-                                sram_wr_data = saturate_i8(
-                                    acc_rd_data + sa_acc[store_row[3:0]][store_col[3:0]]);
+                            if (r_dtype) begin
+                                // Last K-tile FP16: accumulate, convert to FP16, write 2 bytes
+                                automatic logic [31:0] acc_sum = acc_rd_data + sa_acc[store_row[3:0]][store_col[3:0]];
+                                automatic logic [15:0] fp16_val = fp32_to_fp16(acc_sum);
+                                sram_wr_en   = 1'b1;
+                                sram_wr_addr = c_tile_base + ({11'b0, store_row} * (r_N << 1)) + ({11'b0, store_col} << 1) + {15'b0, store_byte};
+                                sram_wr_data = store_byte ? fp16_val[15:8] : fp16_val[7:0];
+                            end else begin
+                                // Last K-tile INT8: accumulate, requantize, write to output SRAM
+                                sram_wr_en   = 1'b1;
+                                sram_wr_addr = c_tile_base + {11'b0, store_row} * r_N + {11'b0, store_col};
+                                if (r_do_requant)
+                                    sram_wr_data = requantize(
+                                        acc_rd_data + sa_acc[store_row[3:0]][store_col[3:0]],
+                                        r_scale, r_shift);
+                                else
+                                    sram_wr_data = saturate_i8(
+                                        acc_rd_data + sa_acc[store_row[3:0]][store_col[3:0]]);
+                            end
                         end else begin
                             // Middle K-tile: accumulate and write back to ACC SRAM
                             acc_wr_en   = 1'b1;
@@ -356,6 +449,7 @@ module gemm_ctrl
             r_do_requant  <= 1'b0;
             r_scale       <= '0;
             r_shift       <= '0;
+            r_dtype       <= 1'b0;
             m_eff         <= '0;
             n_eff         <= '0;
             k_eff         <= '0;
@@ -372,6 +466,9 @@ module gemm_ctrl
             load_row      <= '0;
             load_col      <= '0;
             load_phase    <= 1'b0;
+            load_byte     <= 1'b0;
+            store_byte    <= 1'b0;
+            lo_byte       <= '0;
             stream_cnt    <= '0;
             stream_total  <= '0;
             store_row     <= '0;
@@ -382,6 +479,12 @@ module gemm_ctrl
             for (int i = 0; i < ARRAY_N; i++)
                 for (int j = 0; j < ARRAY_N; j++)
                     buf_b[i][j] <= '0;
+            for (int i = 0; i < ARRAY_M; i++)
+                for (int j = 0; j < ARRAY_N; j++)
+                    buf_a_fp16[i][j] <= '0;
+            for (int i = 0; i < ARRAY_N; i++)
+                for (int j = 0; j < ARRAY_N; j++)
+                    buf_b_fp16[i][j] <= '0;
         end else begin
             case (state)
                 ST_IDLE: begin
@@ -396,6 +499,7 @@ module gemm_ctrl
                         r_do_requant  <= cmd_flags[FLAG_REQUANT];
                         r_scale       <= cmd_imm[7:0];
                         r_shift       <= cmd_imm[15:8];
+                        r_dtype       <= cmd_dtype;
                     end
                 end
 
@@ -422,45 +526,87 @@ module gemm_ctrl
                     end
 
                     // Compute tile base addresses
-                    // a_tile_base = src0 + m_tile*16*K + k_tile*16
-                    a_tile_base <= r_src0 + {8'b0, m_tile_r, 4'b0} * r_K + {8'b0, k_tile_r, 4'b0};
+                    if (r_dtype) begin
+                        // FP16: 2 bytes per element
+                        a_tile_base <= r_src0 + ({8'b0, m_tile_r, 4'b0} * (r_K <<< 1)) + ({8'b0, k_tile_r, 4'b0} <<< 1);
 
-                    if (r_transpose_b)
-                        // B stored as [N][K]: b_tile_base = src1 + n_tile*16*K + k_tile*16
-                        b_tile_base <= r_src1 + {8'b0, n_tile_r, 4'b0} * r_K + {8'b0, k_tile_r, 4'b0};
-                    else
-                        // B stored as [K][N]: b_tile_base = src1 + k_tile*16*N + n_tile*16
-                        b_tile_base <= r_src1 + {8'b0, k_tile_r, 4'b0} * r_N + {8'b0, n_tile_r, 4'b0};
+                        if (r_transpose_b)
+                            b_tile_base <= r_src1 + ({8'b0, n_tile_r, 4'b0} * (r_K <<< 1)) + ({8'b0, k_tile_r, 4'b0} <<< 1);
+                        else
+                            b_tile_base <= r_src1 + ({8'b0, k_tile_r, 4'b0} * (r_N <<< 1)) + ({8'b0, n_tile_r, 4'b0} <<< 1);
 
-                    // c_tile_base = dst + m_tile*16*N + n_tile*16
-                    c_tile_base <= r_dst + {8'b0, m_tile_r, 4'b0} * r_N + {8'b0, n_tile_r, 4'b0};
+                        c_tile_base <= r_dst + ({8'b0, m_tile_r, 4'b0} * (r_N <<< 1)) + ({8'b0, n_tile_r, 4'b0} <<< 1);
+                    end else begin
+                        // INT8: 1 byte per element
+                        // a_tile_base = src0 + m_tile*16*K + k_tile*16
+                        a_tile_base <= r_src0 + {8'b0, m_tile_r, 4'b0} * r_K + {8'b0, k_tile_r, 4'b0};
+
+                        if (r_transpose_b)
+                            // B stored as [N][K]: b_tile_base = src1 + n_tile*16*K + k_tile*16
+                            b_tile_base <= r_src1 + {8'b0, n_tile_r, 4'b0} * r_K + {8'b0, k_tile_r, 4'b0};
+                        else
+                            // B stored as [K][N]: b_tile_base = src1 + k_tile*16*N + n_tile*16
+                            b_tile_base <= r_src1 + {8'b0, k_tile_r, 4'b0} * r_N + {8'b0, n_tile_r, 4'b0};
+
+                        // c_tile_base = dst + m_tile*16*N + n_tile*16
+                        c_tile_base <= r_dst + {8'b0, m_tile_r, 4'b0} * r_N + {8'b0, n_tile_r, 4'b0};
+                    end
 
                     // Reset load/store counters
                     load_row    <= '0;
                     load_col    <= '0;
                     load_phase  <= 1'b0;
+                    load_byte   <= 1'b0;
+                    lo_byte     <= '0;
                     stream_cnt  <= '0;
                     store_row   <= '0;
                     store_col   <= '0;
                     store_phase <= 1'b0;
+                    store_byte  <= 1'b0;
                 end
 
                 ST_LOAD_A: begin
                     if (!load_phase) begin
                         load_phase <= 1'b1;
                     end else begin
-                        buf_a[load_row][load_col] <= signed'(sram_rd_data);
-                        load_phase <= 1'b0;
-                        if (load_col == k_eff - 5'd1) begin
-                            load_col <= '0;
-                            if (load_row == m_eff - 5'd1) begin
-                                load_row   <= '0;
-                                load_col   <= '0;
+                        if (r_dtype) begin
+                            // FP16: capture byte
+                            if (!load_byte) begin
+                                lo_byte <= sram_rd_data;
+                                load_byte <= 1'b1;
+                                load_phase <= 1'b0; // go back for high byte
                             end else begin
-                                load_row <= load_row + 5'd1;
+                                buf_a_fp16[load_row][load_col] <= signed'({sram_rd_data, lo_byte});
+                                load_byte <= 1'b0;
+                                load_phase <= 1'b0;
+                                // advance element
+                                if (load_col == k_eff - 5'd1) begin
+                                    load_col <= '0;
+                                    if (load_row == m_eff - 5'd1) begin
+                                        load_row <= '0;
+                                        load_col <= '0;
+                                    end else begin
+                                        load_row <= load_row + 5'd1;
+                                    end
+                                end else begin
+                                    load_col <= load_col + 5'd1;
+                                end
                             end
                         end else begin
-                            load_col <= load_col + 5'd1;
+                            // INT8: existing behavior
+                            buf_a[load_row][load_col] <= signed'(sram_rd_data);
+                            load_phase <= 1'b0;
+                            if (load_col == k_eff - 5'd1) begin
+                                load_col <= '0;
+                                if (load_row == m_eff - 5'd1) begin
+                                    load_row   <= '0;
+                                    load_col   <= '0;
+                                end else begin
+                                    load_row <= load_row + 5'd1;
+                                end
+                            end else begin
+                                load_col <= load_col + 5'd1;
+                            end
                         end
                     end
                 end
@@ -469,18 +615,44 @@ module gemm_ctrl
                     if (!load_phase) begin
                         load_phase <= 1'b1;
                     end else begin
-                        buf_b[load_row][load_col] <= signed'(sram_rd_data);
-                        load_phase <= 1'b0;
-                        if (load_col == n_eff - 5'd1) begin
-                            load_col <= '0;
-                            if (load_row == k_eff - 5'd1) begin
-                                load_row <= '0;
-                                load_col <= '0;
+                        if (r_dtype) begin
+                            // FP16: capture byte
+                            if (!load_byte) begin
+                                lo_byte <= sram_rd_data;
+                                load_byte <= 1'b1;
+                                load_phase <= 1'b0; // go back for high byte
                             end else begin
-                                load_row <= load_row + 5'd1;
+                                buf_b_fp16[load_row][load_col] <= signed'({sram_rd_data, lo_byte});
+                                load_byte <= 1'b0;
+                                load_phase <= 1'b0;
+                                // advance element
+                                if (load_col == n_eff - 5'd1) begin
+                                    load_col <= '0;
+                                    if (load_row == k_eff - 5'd1) begin
+                                        load_row <= '0;
+                                        load_col <= '0;
+                                    end else begin
+                                        load_row <= load_row + 5'd1;
+                                    end
+                                end else begin
+                                    load_col <= load_col + 5'd1;
+                                end
                             end
                         end else begin
-                            load_col <= load_col + 5'd1;
+                            // INT8: existing behavior
+                            buf_b[load_row][load_col] <= signed'(sram_rd_data);
+                            load_phase <= 1'b0;
+                            if (load_col == n_eff - 5'd1) begin
+                                load_col <= '0;
+                                if (load_row == k_eff - 5'd1) begin
+                                    load_row <= '0;
+                                    load_col <= '0;
+                                end else begin
+                                    load_row <= load_row + 5'd1;
+                                end
+                            end else begin
+                                load_col <= load_col + 5'd1;
+                            end
                         end
                     end
                 end
@@ -496,12 +668,28 @@ module gemm_ctrl
 
                 ST_STORE: begin
                     if (!multi_k) begin
-                        // Single K-tile: advance every cycle
-                        if (store_col == n_eff - 5'd1) begin
-                            store_col <= '0;
-                            store_row <= store_row + 5'd1;
+                        // Single K-tile
+                        if (r_dtype) begin
+                            // FP16: 2 bytes per element
+                            if (!store_byte) begin
+                                store_byte <= 1'b1;
+                            end else begin
+                                store_byte <= 1'b0;
+                                if (store_col == n_eff - 5'd1) begin
+                                    store_col <= '0;
+                                    store_row <= store_row + 5'd1;
+                                end else begin
+                                    store_col <= store_col + 5'd1;
+                                end
+                            end
                         end else begin
-                            store_col <= store_col + 5'd1;
+                            // INT8: advance every cycle
+                            if (store_col == n_eff - 5'd1) begin
+                                store_col <= '0;
+                                store_row <= store_row + 5'd1;
+                            end else begin
+                                store_col <= store_col + 5'd1;
+                            end
                         end
                     end else if (first_k_tile) begin
                         // First K-tile of multi-K: write ACC, 1 cycle per element
@@ -517,13 +705,30 @@ module gemm_ctrl
                             // Phase 0 -> phase 1 (read issued, wait for data)
                             store_phase <= 1'b1;
                         end else begin
-                            // Phase 1 -> phase 0, advance counters
-                            store_phase <= 1'b0;
-                            if (store_col == n_eff - 5'd1) begin
-                                store_col <= '0;
-                                store_row <= store_row + 5'd1;
+                            if (r_dtype && last_k_tile) begin
+                                // Last K-tile FP16: need to write 2 bytes after accumulate
+                                if (!store_byte) begin
+                                    store_byte <= 1'b1;
+                                end else begin
+                                    // Both bytes written, advance
+                                    store_byte  <= 1'b0;
+                                    store_phase <= 1'b0;
+                                    if (store_col == n_eff - 5'd1) begin
+                                        store_col <= '0;
+                                        store_row <= store_row + 5'd1;
+                                    end else begin
+                                        store_col <= store_col + 5'd1;
+                                    end
+                                end
                             end else begin
-                                store_col <= store_col + 5'd1;
+                                // Phase 1 -> phase 0, advance counters
+                                store_phase <= 1'b0;
+                                if (store_col == n_eff - 5'd1) begin
+                                    store_col <= '0;
+                                    store_row <= store_row + 5'd1;
+                                end else begin
+                                    store_col <= store_col + 5'd1;
+                                end
                             end
                         end
                     end

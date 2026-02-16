@@ -2,7 +2,7 @@
 
 A minimal neural processing unit in SystemVerilog, optimized for learning how NPUs work from the ground up.
 
-Built with fully documented SystemVerilog RTL, two execution modes (LLM Mode for transformer inference and Graph Mode for ONNX models), a complete 128-bit microcode ISA, working GPT-2, LLaMA, Mistral and Qwen2 inference running on real HuggingFace weights, KV-cache optimization, an ONNX compiler supporting Gemm, Conv, Reduce, Exp/Log/Sqrt, Gather, Slice, Concat, BatchNorm, AvgPool and more, 50-model fuzz testing, and full Verilator simulation with cycle-accurate verification.
+Built with fully documented SystemVerilog RTL, two execution modes (LLM Mode for transformer inference and Graph Mode for ONNX models), a complete 128-bit microcode ISA, working GPT-2, LLaMA, Mistral and Qwen2 inference running on real HuggingFace weights, KV-cache optimization, an ONNX compiler supporting Gemm, Conv, Reduce, Exp/Log/Sqrt, Gather, Slice, Concat, BatchNorm, AvgPool, MaxPool, Pad, Resize, Cast and more, FP16 arithmetic (MAC, math LUTs, softmax, layernorm), async dispatch with DMA+GEMM overlap and performance counters, 50-model fuzz testing, and full Verilator simulation with cycle-accurate verification.
 
 ### Table of Contents
 
@@ -47,7 +47,7 @@ This is why I built `tiny-npu`.
 >
 > **tiny-npu** is a minimal, fully synthesizable neural processing unit in SystemVerilog, optimized for learning about how NPUs work from the ground up.
 >
-> It supports two execution modes: **LLM Mode** for running real transformer models (GPT-2, LLaMA, Mistral, Qwen2) with a 128-bit microcode ISA, and **Graph Mode** for running ONNX models with a dedicated graph ISA, tensor descriptor table, and 9 hardware engines (GEMM, Softmax, Reduce, Math LUT, Gather, Slice, Concat, AvgPool, plus inline element-wise). Both modes share the same compute core and on-chip SRAM.
+> It supports two execution modes: **LLM Mode** for running real transformer models (GPT-2, LLaMA, Mistral, Qwen2) with a 128-bit microcode ISA, and **Graph Mode** for running ONNX models with a dedicated graph ISA, tensor descriptor table, and 13 hardware engines (GEMM with INT8+FP16 dual MAC, Softmax, Reduce, Math LUT, Gather, Slice, Concat, AvgPool, MaxPool, Pad, Resize Nearest, Cast, plus inline element-wise). Graph Mode includes async dispatch with scoreboard-based DMA+GEMM overlap, hardware performance counters, and FP16 support throughout the pipeline. Both modes share the same compute core and on-chip SRAM.
 
 With this motivation in mind, we can strip away the complexity of production-grade accelerators (multi-chip interconnects, HBM controllers, sparsity engines) and focus on the core elements that make neural network inference work in hardware:
 
@@ -57,9 +57,11 @@ With this motivation in mind, we can strip away the complexity of production-gra
 4. **Memory Management** - How do you fit weights, activations, and intermediate results in limited on-chip SRAM?
 5. **KV-Cache Optimization** - How does caching key/value vectors make autoregressive decoding faster?
 6. **Graph Execution** - How does a hardware FSM walk an ONNX computation graph, issuing DMA, GEMM, and element-wise ops automatically?
-7. **Dedicated Engines** - How do purpose-built hardware engines for reduce, gather, slice, concat, and pooling accelerate graph execution?
+7. **Dedicated Engines** - How do purpose-built hardware engines for reduce, gather, slice, concat, pooling, padding, and resizing accelerate graph execution?
+8. **Mixed Precision** - How do INT8 and FP16 datapaths coexist in a dual-MAC processing element, with automatic dtype inference and cast insertion?
+9. **Async Scheduling** - How does a tensor scoreboard enable DMA+GEMM overlap for higher utilization?
 
-The result: a chip that runs real GPT-2, LLaMA, Mistral and Qwen2 weights from HuggingFace through INT8 quantized inference with multi-head attention, and also compiles and executes arbitrary ONNX models end-to-end (verified across 50 fuzz-generated random graphs) - all cycle-accurate against Python and C++ golden models.
+The result: a chip that runs real GPT-2, LLaMA, Mistral and Qwen2 weights from HuggingFace through INT8 quantized inference with multi-head attention, and also compiles and executes arbitrary ONNX models end-to-end with INT8 and FP16 support, async DMA+GEMM overlap, and 13 dedicated hardware engines (verified across 50 fuzz-generated random graphs) - all cycle-accurate against Python and C++ golden models.
 
 # Architecture
 
@@ -93,15 +95,20 @@ The result: a chip that runs real GPT-2, LLaMA, Mistral and Qwen2 weights from H
                          |  Engines      |  |  Engines |  | (rotate) |
                          +---------------+  +----------+  +----------+
 
-                    Graph Mode Phase 3 Engines (dedicated hardware)
-                    ================================================
+                    Graph Mode Engines (13 dedicated hardware units)
+                    =================================================
     +-----------+ +-----------+ +-----------+ +-----------+ +-----------+
     |  Reduce   | |   Math    | |  Gather   | |Slice/Concat| | AvgPool2D|
     | Sum/Max/  | | Exp/Log/  | | Axis-0    | | Last-dim  | | Sliding  |
     |  Mean     | | Sqrt/Rsqrt| | row copy  | | operations| | window   |
-    | INT32 acc | | 256-entry | |           | |           | | INT32 acc|
+    | INT32 acc | | INT8+FP16 | |           | |           | | INT32 acc|
     +-----------+ |  LUTs     | +-----------+ +-----------+ +----------+
                   +-----------+
+    +-----------+ +-----------+ +-----------+ +-----------+
+    | MaxPool2D | |    Pad    | |  Resize   | |   Cast    |
+    | Sliding   | | Constant-0| | Nearest-  | | INT8<->   |
+    | window max| | padding   | | neighbor  | | FP16      |
+    +-----------+ +-----------+ +-----------+ +-----------+
                                   |
                     +-------------v--------------+
                     |     On-Chip SRAM Banks      |
@@ -115,7 +122,7 @@ The NPU supports two execution modes selected via the `REG_EXEC_MODE` register:
 
 - **LLM Mode** (`EXEC_MODE=0`, default) - The microcode controller fetches 128-bit instructions from SRAM, decodes them, and dispatches to 6 independent engines via a scoreboard. Used for transformer inference (GPT-2, LLaMA, Mistral, Qwen2).
 
-- **Graph Mode** (`EXEC_MODE=1`) - The graph pipeline fetches 128-bit graph ISA instructions from a dedicated program SRAM, looks up tensor descriptors from a 256-entry table, and dispatches to 9 hardware engines serially (one at a time). Supports GEMM, Softmax, Reduce (Sum/Max/Mean), Math (Exp/Log/Sqrt/Rsqrt via LUT), Gather, Slice, Concat, AvgPool2D, and inline element-wise ops. Used for ONNX model inference.
+- **Graph Mode** (`EXEC_MODE=1`) - The graph pipeline fetches 128-bit graph ISA instructions from a dedicated program SRAM, looks up tensor descriptors from a 256-entry table, and dispatches to 13 hardware engines with async scheduling (scoreboard-based DMA+GEMM overlap in OVERLAP mode, or serialized in SERIAL mode). Supports INT8 and FP16 datatypes with automatic cast insertion. Engines: GEMM (dual INT8/FP16 MAC), Softmax, Reduce (Sum/Max/Mean), Math (Exp/Log/Sqrt/Rsqrt via INT8 and FP16 LUTs), Gather, Slice, Concat, AvgPool2D, MaxPool2D, Pad, Resize Nearest, Cast, and inline element-wise ops. Used for ONNX model inference.
 
 Both modes share all compute engines (GEMM, Softmax, etc.) and SRAM. They are fully isolated - switching modes requires no reset, just writing the `REG_EXEC_MODE` register.
 
@@ -237,7 +244,7 @@ SRAM0 Memory Map (LLM Mode - one transformer block, 4-head attention)
 
 The head-blocked QKV layout keeps total weight size unchanged (3 x 4096B = 12KB for QKV) while enabling direct per-head addressing: head h's query weights are at `Wq + h * 1024`.
 
-In **Graph Mode**, SRAM0 is allocated dynamically by the ONNX compiler with a first-fit memory planner that reuses freed buffers. The SRAM0 mux priority ensures correct arbitration: `ew > gemm > softmax > reduce > math > gather > slice > concat > avgpool > testbench`.
+In **Graph Mode**, SRAM0 is allocated dynamically by the ONNX compiler with a first-fit memory planner that reuses freed buffers. The SRAM0 mux uses `rd_en`/`wr_en` signals (not `busy`) for arbitration, enabling DMA to access SRAM during GEMM compute phases when the GEMM engine is busy but not reading/writing SRAM. Priority order: `ew > gemm > softmax > reduce > math > gather > slice > concat > avgpool > maxpool > pad > resize > cast > testbench`.
 
 **SRAM1 (8KB)** - Auxiliary storage for LayerNorm beta parameters and residual connections (LLM Mode only). Separated from SRAM0 because the vec engine needs to read from both SRAM0 and SRAM1 simultaneously for residual adds.
 
@@ -272,11 +279,11 @@ Each engine is a specialized hardware unit optimized for one class of operation.
 
 ### GEMM Engine (Engine 0)
 
-The core compute unit. A **16x16 weight-stationary systolic array** that performs INT8 matrix multiplication with INT32 accumulation.
+The core compute unit. A **16x16 weight-stationary systolic array** (parameterizable to 24x24) with **dual MAC units** per processing element supporting both INT8 and FP16 datatypes.
 
 ```
-Weight-Stationary Systolic Array (16x16)
-=========================================
+Weight-Stationary Systolic Array (16x16, dual MAC)
+====================================================
 
   Activations flow DOWN (one row per cycle)
          |     |     |     |           |
@@ -293,8 +300,9 @@ Weight-Stationary Systolic Array (16x16)
   -->  | MAC | MAC | MAC | MAC ... | MAC |  -->  Output
        +-----+-----+-----+-----   +-----+
 
-  256 MACs = 256 INT8 multiplies per cycle
-  Each MAC: accumulator += activation * weight (INT32)
+  Each PE contains: mac_int8 + mac_fp16, muxed by dtype_fp16 signal
+  INT8 mode:  256 INT8 multiplies/cycle, INT32 accumulation
+  FP16 mode:  256 FP16 multiplies/cycle, FP32 accumulation -> FP16 output
 ```
 
 For matrices larger than 16x16, the **GEMM controller** tiles the computation automatically. A `[16][64] * [64][256]` GEMM is broken into `(1)(4)(16) = 64` tiles of 16x16, with partial sums accumulated across the K dimension.
@@ -384,6 +392,11 @@ Supported ONNX operations:
 | `Add` / `Sub` / `Mul` | EW_ADD / EW_SUB / EW_MUL (inline 3-cycle/element loop) |
 | `BatchNormalization` | Compiler lowering to EW_MUL + EW_ADD (pre-computed scale/offset) |
 | `AveragePool` | AVGPOOL2D engine (sliding window, INT32 accumulator) |
+| `MaxPool` | MAXPOOL2D engine (sliding window max) |
+| `Pad` | PAD engine (constant-0 padding for NCHW tensors) |
+| `Resize` (nearest) | RESIZE_NEAREST engine (nearest-neighbor upsampling) |
+| `Cast` | CAST engine (INT8 <-> FP16 conversion, auto-inserted by compiler) |
+| `Clip` | Compiler lowering to EW_MAX + EW_MIN sequence |
 
 Verified models:
 - **MLP**: `[1,32] -> Gemm -> ReLU -> Gemm -> [1,8]` (exact byte match)
@@ -393,7 +406,10 @@ Verified models:
 - **Gather**: `[4,8] + indices -> Gather(axis=0) -> [2,8]` (exact byte match)
 - **Slice+Concat**: `[1,8] -> Slice -> [1,4]`, then Concat -> `[1,12]` (exact byte match)
 - **BatchNorm+Pool**: `[1,4,6,6] -> BN -> ReLU -> AvgPool(2x2) -> [1,4,3,3]` (exact byte match)
-- **Fuzz**: 50 randomly generated graphs (5-15 nodes, random shapes) - all pass
+- **Overlap Perf**: `[1,64] -> Gemm(64,64) -> ReLU -> Gemm(64,64) -> ReLU -> Gemm(64,32) -> [1,32]` with large tiled GEMMs (exact byte match, async dispatch with perf counters)
+- **FP16 Smoke**: `[1,16] -> Gemm(FP16) -> ReLU -> Gemm(FP16) -> [1,4]` (exact byte match)
+- **Mixed Precision CNN**: `[1,2,8,8] -> Conv(INT8) -> ReLU -> MaxPool(2x2) -> [1,4,4,4]` with dtype transitions (exact byte match)
+- **Fuzz**: 50 randomly generated graphs (5-15 nodes, random shapes) - all supported ops pass
 - **Stress**: 56-node deep graph exercising all engine types (exact byte match)
 
 # LLM Mode ISA
@@ -662,6 +678,10 @@ Graph Mode uses a separate 128-bit instruction format optimized for tensor opera
 | 0x68 | `OP_G_SLICE` | Slice | Materialized N-D slice |
 | 0x69 | `OP_G_CONCAT` | Concat | Last-dimension concatenation |
 | 0x70 | `OP_G_AVGPOOL2D` | AvgPool | 2D average pooling with sliding window |
+| 0x71 | `OP_G_MAXPOOL2D` | MaxPool | 2D max pooling with sliding window |
+| 0x72 | `OP_G_RESIZE_NEAREST` | Resize | Nearest-neighbor upsampling |
+| 0x78 | `OP_G_PREFETCH` | DMA | Best-effort DMA prefetch hint |
+| 0x7A | `OP_G_CAST` | Cast | INT8 <-> FP16 dtype conversion |
 
 ### GEMM Flags (Graph Mode)
 
@@ -704,8 +724,16 @@ Three cycles are spent looking up tensor descriptors (src0, src1, dst) from the 
 - **SLICE**: Programs the slice engine with source/destination row lengths and start offset, waits for `sl_done`
 - **CONCAT**: Programs the concat engine with two source bases and row lengths, waits for `ct_done`
 - **AVGPOOL2D**: Programs the pooling engine with C/H/W and kernel/stride parameters, waits for `ap_done`
+- **MAXPOOL2D**: Programs the max pooling engine similarly to AvgPool, waits for `mp_done`
+- **PAD**: Programs the pad engine with C/H/W and pad amounts, waits for `pd_done`
+- **RESIZE_NEAREST**: Programs the resize engine with input/output dims, waits for `rn_done`
+- **CAST**: Programs the cast engine with source/dest dtype and length, waits for `ca_done`
 
-Hardware performance counters track cycles spent in each engine type. A configurable timeout (default 1M cycles per op) triggers `GERR_TIMEOUT` if any engine hangs.
+The dispatcher supports two scheduling modes via `scheduler_mode`:
+- **SERIAL** (mode 0): Execute one instruction at a time (fully serialized, safe default)
+- **OVERLAP** (mode 1): Async dispatch with tensor scoreboard — allows DMA + one compute engine to run concurrently when their tensor dependencies are satisfied
+
+Hardware performance counters track cycles spent in each engine type, plus `perf_overlap_cycles` (DMA+GEMM concurrent) and `perf_stall_cycles` (dispatcher blocked by dependencies). A configurable timeout (default 1M cycles per op) triggers `GERR_TIMEOUT` if any engine hangs.
 
 Error detection halts the FSM on bad opcodes, GEMM shape mismatches, or engine timeouts.
 
@@ -760,7 +788,11 @@ Key compiler decisions:
 - **Bias handling**: Bias is added AFTER requantization via a separate `EW_ADD` instruction (matches RTL pipeline order)
 - **Conv lowering**: im2col is pre-materialized by the compiler in DDR, then loaded to SRAM and multiplied via GEMM
 - **BatchNorm lowering**: Pre-computes `scale/sqrt(var+eps)` and `bias - mean*multiplier`, then emits EW_MUL + EW_ADD (no new RTL needed)
-- **Memory planner**: First-fit allocator with liveness analysis. Tensors are freed after their last use and memory is reclaimed for subsequent allocations. `--no-reuse` flag disables reuse for debugging.
+- **Clip lowering**: Emits EW_MAX(x, min) then EW_MIN(result, max) sequence
+- **MaxPool/Pad/Resize lowering**: Direct 1:1 mapping to dedicated engine opcodes
+- **dtype propagation**: Infers tensor dtypes through the graph (INT8 for GEMM outputs, FP16 for Softmax/LayerNorm internals)
+- **Cast insertion**: Automatically inserts OP_G_CAST instructions where producer dtype != consumer expected dtype
+- **Memory planner**: First-fit allocator with liveness analysis. Tensors are freed after their last use and memory is reclaimed for subsequent allocations. In-place operations (e.g., ReLU) transfer the allocation from input to output to prevent premature reuse. `--no-reuse` flag disables reuse for debugging.
 - **SRAM tracking**: The compiler tracks which tensors are "live" in SRAM to avoid redundant DMA loads
 
 # Inference Demo
@@ -874,7 +906,7 @@ cmake ..
 cmake --build . -j$(nproc)
 ```
 
-This builds 17 simulation targets:
+This builds 21 simulation targets:
 
 | # | Target | Mode | Description |
 |---|--------|------|-------------|
@@ -895,6 +927,10 @@ This builds 17 simulation targets:
 | 15 | `onnx_batchnorm_pool_sim` | Graph | BatchNorm lowering + AvgPool2D engine test |
 | 16 | `onnx_fuzz_sim` | Graph | 50 random fuzz models (all ops, random shapes) |
 | 17 | `onnx_stress_sim` | Graph | 56-node stress test with perf counters |
+| 18 | `onnx_overlap_perf_sim` | Graph | DMA+GEMM overlap performance test (SERIAL vs OVERLAP) |
+| 19 | `onnx_fp16_smoke_sim` | Graph | FP16 GEMM + math pipeline smoke test |
+| 20 | `mixed_precision_cnn_sim` | Graph | Mixed INT8/FP16 CNN with dtype transitions |
+| 21 | `onnx_resize_pad_sim` | Graph | Pad + Resize nearest engine test |
 
 ### Run Unit Tests (LLM Mode)
 
@@ -1112,6 +1148,27 @@ cd sim/verilator/build
 ./onnx_stress_sim --datadir graph_stress
 ```
 
+**Phase 4 Tests** (Overlap Performance, FP16, Mixed Precision):
+
+```bash
+cd npu
+
+# Overlap performance test (large tiled GEMMs with async dispatch)
+python3 python/onnx_compiler/gen_overlap_perf_onnx.py
+python3 python/onnx_compiler/compile.py --model models/overlap_perf_test.onnx --outdir sim/verilator/build/graph_overlap_perf
+cd sim/verilator/build && ./onnx_overlap_perf_sim --datadir graph_overlap_perf && cd ../../..
+
+# FP16 smoke test (FP16 GEMM pipeline)
+python3 python/onnx_compiler/gen_fp16_smoke_onnx.py
+python3 python/onnx_compiler/compile.py --model models/fp16_smoke_test.onnx --outdir sim/verilator/build/graph_fp16_smoke
+cd sim/verilator/build && ./onnx_fp16_smoke_sim --datadir graph_fp16_smoke && cd ../../..
+
+# Mixed precision CNN (INT8 Conv + ReLU + MaxPool with dtype transitions)
+python3 python/onnx_compiler/gen_mixed_precision_cnn_onnx.py
+python3 python/onnx_compiler/compile.py --model models/mixed_precision_cnn_test.onnx --outdir sim/verilator/build/graph_mixed_cnn
+cd sim/verilator/build && ./mixed_precision_cnn_sim --datadir graph_mixed_cnn && cd ../../..
+```
+
 ### Run KV Cache Correctness Test
 
 Verifies that KV-cached decode produces bit-exact results vs full-recompute:
@@ -1155,9 +1212,15 @@ cd npu/sim/verilator/build
 ./onnx_math_sim --datadir graph_math
 ./onnx_gather_sim --datadir graph_gather
 ./onnx_slice_concat_sim --datadir graph_slice_concat
-./onnx_batchnorm_pool_sim --datadir graph_bn_pool
+./onnx_batchnorm_pool_sim --datadir graph_batchnorm_pool
 ./onnx_fuzz_sim --datadir graph_fuzz
 ./onnx_stress_sim --datadir graph_stress
+
+# Graph Mode Phase 4 (needs Phase 4 model compilation)
+./onnx_overlap_perf_sim --datadir graph_overlap_perf
+./onnx_fp16_smoke_sim --datadir graph_fp16_smoke
+./mixed_precision_cnn_sim --datadir graph_mixed_cnn
+./onnx_resize_pad_sim --datadir graph_resize_pad
 ```
 
 ### Debug with Waveforms
@@ -1176,12 +1239,10 @@ For the sake of clarity and learnability, tiny-npu omits many optimizations foun
 
 ### Floating Point / Mixed Precision
 
-tiny-npu uses pure INT8 computation with INT32 accumulators. Production NPUs typically use:
-- **FP16/BF16** for activations and weights (better dynamic range)
-- **FP32** accumulators (prevents overflow in large GEMMs)
-- **INT8/INT4** with dynamic quantization (for inference optimization)
-
-The fixed-point approach in tiny-npu works well for small models but would need wider data types for production-scale models.
+tiny-npu supports both **INT8** (with INT32 accumulators) and **FP16** (IEEE 754 half-precision with FP32 accumulators) via dual MAC units in every processing element. The ONNX compiler automatically infers dtypes and inserts `OP_G_CAST` instructions where needed. FP16 is used for Softmax/LayerNorm internals (better dynamic range) while INT8 handles most GEMM and element-wise operations. Production NPUs would additionally support:
+- **BF16** (brain floating point, wider dynamic range than FP16)
+- **INT4** with dynamic quantization
+- **Block-wise mixed precision** (different precisions per layer)
 
 ### Hardware KV Cache
 
@@ -1189,9 +1250,9 @@ tiny-npu includes a fully integrated hardware KV cache. The `kv_cache_bank.sv` m
 
 ### Pipelining and Double Buffering
 
-tiny-npu executes operations sequentially with explicit barriers between dependent operations. Production NPUs use:
-- **Double buffering** - Load next layer's weights while current layer computes
-- **Instruction pipelining** - Overlap fetch/decode/execute stages
+tiny-npu's Graph Mode supports **async dispatch** with a tensor scoreboard that enables DMA+GEMM overlap (configurable SERIAL vs OVERLAP scheduling modes). A `tile_buffer.sv` dual-bank staging buffer is available for future GEMM weight prefetching. Production NPUs additionally use:
+- **Full double buffering** - Dedicated ping-pong buffers for all engine inputs
+- **Deep instruction pipelining** - Multiple instructions in-flight simultaneously
 - **Engine pipelining** - Start LayerNorm while GEMM is still finishing its last tile
 
 ### Memory Coalescing and Tiling
@@ -1212,12 +1273,15 @@ Production NPUs increasingly exploit sparsity in weights and activations:
 Improvements I want to make to the design:
 
 - [x] Integrate hardware KV cache (`kv_cache_bank.sv` + `kv_ctrl.sv`) into the datapath
-- [ ] Add double buffering for weight loading (DMA + compute overlap)
+- [x] Add async dispatch with DMA+GEMM overlap (scoreboard-based, SERIAL/OVERLAP modes)
+- [x] Add FP16 arithmetic (dual MAC per PE, FP16 LUTs, FP16 softmax/layernorm paths)
+- [x] Graph Mode: parallel engine execution via async dispatch with tensor scoreboard
+- [x] Graph Mode v3: 13 engines (+MaxPool, Pad, Resize, Cast), FP16 pipeline, async dispatch, dtype inference + cast insertion, performance counters (overlap/stall cycles)
+- [ ] Add double-buffered tile staging for GEMM weight prefetch
 - [ ] Scale to full GPT-2 dimensions (hidden=768) with weight streaming
-- [ ] Add FP16 accumulation mode for better dynamic range
 - [ ] FPGA synthesis and on-board demo (Xilinx Zynq / Artix-7)
-- [ ] Graph Mode: parallel engine execution (pipeline DMA with compute)
 - [ ] Graph Mode: automatic SRAM tiling for models exceeding 64KB
+- [ ] Graph Mode: binary element-wise ops (Add/Sub/Mul between two runtime tensors)
 - [x] Support for more model architectures (LLaMA, Mistral, Qwen2 with GQA, RoPE, QKV bias)
 - [x] Graph Mode v1: ONNX compilation and execution (MLP, CNN with im2col)
 - [x] Graph Mode v2: 9 dedicated engines (Reduce, Math LUT, Gather, Slice, Concat, AvgPool2D), BatchNorm lowering, memory planner with reuse, perf counters, 50-model fuzz testing
@@ -1246,32 +1310,43 @@ npu/
       addr_gen.sv              Address generation
       kv_ctrl.sv               KV cache controller FSM (SRAM0 <-> kv_cache_bank bridge)
     graph/                   Graph pipeline (Graph Mode)
-      graph_isa_pkg.sv         Graph ISA opcodes (23 opcodes), instruction/descriptor structs
+      graph_isa_pkg.sv         Graph ISA opcodes (28 opcodes), instruction/descriptor structs
       graph_fetch.sv           Sequential instruction fetch from program SRAM
       graph_decode.sv          Combinational 128-bit -> graph_instr_t decode
-      graph_dispatch.sv        Main FSM: descriptor lookup, engine control, EW loops, perf counters
-      graph_top.sv             Wrapper: fetch + decode + dispatch + ew_busy
+      graph_dispatch.sv        Main FSM: scoreboard, async scheduling, engine control, EW loops, perf counters
+      graph_top.sv             Wrapper: fetch + decode + dispatch + scheduler_mode + new engine ports
       tensor_table.sv          256-entry tensor descriptor register array
       reduce_engine.sv         Reduce engine: Sum/Max/Mean with INT32 accumulator
-      math_engine.sv           Math engine: Exp/Log/Sqrt/Rsqrt via 256-entry LUTs
+      math_engine.sv           Math engine: Exp/Log/Sqrt/Rsqrt via INT8+FP16 LUTs
+      fp16_utils.sv            FP16 combinational arithmetic (add/mul/cmp/convert)
       graph_exp_lut.sv         INT8 -> INT8 exponential lookup table
       graph_log_lut.sv         INT8 -> INT8 logarithm lookup table
       graph_sqrt_lut.sv        INT8 -> INT8 square root lookup table
       graph_rsqrt_lut.sv       INT8 -> INT8 inverse square root lookup table
+      graph_exp_lut_fp16.sv    FP16 exponential lookup table
+      graph_log_lut_fp16.sv    FP16 logarithm lookup table
+      graph_sqrt_lut_fp16.sv   FP16 square root lookup table
+      graph_rsqrt_lut_fp16.sv  FP16 inverse square root lookup table
       gather_engine.sv         Gather engine: axis-0 row copy with bounds check
       slice_engine.sv          Slice engine: materialized N-D slice
       concat_engine.sv         Concat engine: last-dimension interleave
       avgpool2d_engine.sv      AvgPool2D engine: sliding window with INT32 accumulator
+      maxpool2d_engine.sv      MaxPool2D engine: sliding window max
+      pad_engine.sv            Pad engine: constant-0 NCHW padding
+      resize_nearest_engine.sv Resize engine: nearest-neighbor upsampling
+      cast_engine.sv           Cast engine: INT8 <-> FP16 conversion
     mem/                     Memory subsystem
       sram_dp.sv               Dual-port SRAM primitive
       banked_sram.sv           Multi-bank SRAM wrapper
       kv_cache_bank.sv         Hardware KV cache (SRAM-backed)
+      tile_buffer.sv           Dual-bank ping-pong tile staging buffer
     gemm/                    GEMM engine
       mac_int8.sv              INT8 multiply-accumulate unit
-      pe.sv                    Processing element (MAC + register)
-      systolic_array.sv        16x16 weight-stationary systolic array
-      gemm_ctrl.sv             GEMM tiling controller
-      gemm_post.sv             Post-processing (requantize + clamp)
+      mac_fp16.sv              FP16 multiply-accumulate unit (2-stage pipeline)
+      pe.sv                    Dual-MAC processing element (INT8 + FP16, dtype mux)
+      systolic_array.sv        16x16 weight-stationary systolic array (parameterizable to 24x24)
+      gemm_ctrl.sv             GEMM tiling controller (INT8 + FP16 addressing)
+      gemm_post.sv             Post-processing (requantize for INT8, bypass for FP16)
     ops/                     Compute engines
       softmax_engine.sv        3-pass softmax (max, exp+sum, normalize)
       layernorm_engine.sv      LayerNorm (mean, variance, normalize)
@@ -1292,10 +1367,10 @@ npu/
     ddr_graph.h                DDR memory map constants for Graph Mode
   sim/
     verilator/               Verilator simulation environment
-      CMakeLists.txt           Build system (17 targets)
+      CMakeLists.txt           Build system (21 targets, shared Verilator libraries)
       gpt2_block_top.sv        GPT-2 testbench top (SRAMs + ucode + engines)
       llama_block_top.sv       LLaMA testbench top (SRAMs + ucode + engines)
-      onnx_sim_top.sv          Graph Mode testbench top (SRAMs + graph pipeline + 9 engines)
+      onnx_sim_top.sv          Graph Mode testbench top (SRAMs + graph pipeline + 13 engines)
       engine_tb_top.sv         Engine-level testbench wrapper
       integration_top.sv       Integration testbench wrapper
       tb_top.cpp               Target 1: Control plane smoke test
@@ -1315,6 +1390,10 @@ npu/
       tb_onnx_batchnorm_pool.cpp Target 15: BatchNorm + AvgPool2D test
       tb_onnx_fuzz.cpp         Target 16: 50-model fuzz test
       tb_onnx_stress.cpp       Target 17: Stress test with perf counters
+      tb_onnx_overlap_perf.cpp Target 18: DMA+GEMM overlap performance test
+      tb_onnx_fp16_smoke.cpp   Target 19: FP16 pipeline smoke test
+      tb_mixed_precision_cnn.cpp Target 20: Mixed INT8/FP16 CNN test
+      tb_onnx_resize_pad.cpp   Target 21: Pad + Resize nearest test
       run_demo.sh              Automated demo runner script
   python/
     golden/                  Python golden reference models
@@ -1354,6 +1433,10 @@ npu/
       gen_batchnorm_pool_onnx.py Generate BatchNorm + AvgPool test model
       gen_fuzz_onnx.py         Generate 50 random fuzz models
       gen_stress_onnx.py       Generate 56-node stress model
+      gen_overlap_perf_onnx.py Generate 3-layer MLP for overlap perf test
+      gen_fp16_smoke_onnx.py   Generate FP16 GEMM pipeline test
+      gen_mixed_precision_cnn_onnx.py Generate mixed INT8/FP16 CNN test
+      gen_resize_pad_onnx.py   Generate Pad + Resize nearest test
     tests/
       test_end2end.py          Python-level end-to-end tests
     requirements.txt           Python dependencies
@@ -1366,6 +1449,9 @@ npu/
     slice_concat_test.onnx     Slice + Concat test model
     batchnorm_pool_test.onnx   BatchNorm + AvgPool test model
     stress_test.onnx           Stress test model
+    overlap_perf_test.onnx     Overlap performance test model (3-layer MLP, 64x64 GEMMs)
+    fp16_smoke_test.onnx       FP16 pipeline smoke test model
+    mixed_precision_cnn_test.onnx Mixed INT8/FP16 CNN test model
     fuzz/                      50 random fuzz models (case_0.onnx .. case_49.onnx)
   README.md                  This file
 ```

@@ -39,6 +39,19 @@ static constexpr uint8_t OP_G_CONCAT       = 0x69;
 static constexpr uint8_t OP_G_PAD          = 0x6A;
 static constexpr uint8_t OP_G_AVGPOOL2D    = 0x70;
 
+// Phase 4 opcodes
+static constexpr uint8_t OP_G_MAXPOOL2D       = 0x71;
+static constexpr uint8_t OP_G_RESIZE_NEAREST  = 0x72;
+static constexpr uint8_t OP_G_PREFETCH        = 0x78;
+static constexpr uint8_t OP_G_EW_MIN          = 0x39;
+static constexpr uint8_t OP_G_EW_MAX          = 0x3A;
+static constexpr uint8_t OP_G_CAST            = 0x7A;
+
+// Dtype constants
+static constexpr uint8_t DTYPE_INT8  = 0x00;
+static constexpr uint8_t DTYPE_FP16  = 0x01;
+static constexpr uint8_t DTYPE_INT32 = 0x02;
+
 // =========================================================================
 // GEMM flags (matches isa_pkg.sv FLAG_* constants)
 // =========================================================================

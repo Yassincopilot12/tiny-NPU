@@ -3,8 +3,10 @@
 // Contains: program SRAM, tensor table, SRAM0 (65536), ACC SRAM, scratch SRAM,
 //           gemm_ctrl, systolic_array, softmax_engine, graph pipeline, DMA shim,
 //           Phase 3 engines: reduce, math, gather, slice, concat, avgpool2d
+//           Phase 4 engines: maxpool2d, pad, resize_nearest, cast
 //
-// SRAM0 mux priority: gp_ew > gm > sm > re > me > ga > sl > ct > ap > tb
+// SRAM0 mux priority: gp_ew > gm > sm > re > me > ga > sl > ct > ap > mp > pd > rz > ca > tb
+// Phase 4: SRAM mux uses rd_en/wr_en instead of busy for arbitration (enables overlap)
 // =============================================================================
 `default_nettype none
 
@@ -25,6 +27,7 @@ module onnx_sim_top
     // --- Control ---
     input  wire                start_pulse,
     input  wire  [15:0]        prog_len,
+    input  wire                scheduler_mode,  // 0=SERIAL, 1=OVERLAP
     output wire                graph_done,
 
     // --- Program SRAM write (TB loads program via port B) ---
@@ -69,6 +72,8 @@ module onnx_sim_top
     output wire  [31:0]        perf_concat_cycles,
     output wire  [31:0]        perf_avgpool_cycles,
     output wire  [31:0]        perf_ew_cycles,
+    output wire  [31:0]        perf_overlap_cycles,
+    output wire  [31:0]        perf_stall_cycles,
 
     // --- Debug ---
     output wire  [31:0]        graph_status,
@@ -130,6 +135,10 @@ module onnx_sim_top
     logic signed [7:0]  gm_sa_b_row [16];
     logic signed [31:0] gm_sa_acc   [16][16];
 
+    logic gm_dtype_fp16;
+    logic signed [15:0] gm_sa_a_col_fp16 [16];
+    logic signed [15:0] gm_sa_b_row_fp16 [16];
+
     logic        gm_acc_rd_en, gm_acc_wr_en;
     logic [7:0]  gm_acc_rd_addr, gm_acc_wr_addr;
     logic signed [31:0] gm_acc_rd_data, gm_acc_wr_data;
@@ -140,6 +149,7 @@ module onnx_sim_top
     logic [15:0] gp_gm_cmd_M, gp_gm_cmd_N, gp_gm_cmd_K;
     logic [7:0]  gp_gm_cmd_flags;
     logic [15:0] gp_gm_cmd_imm;
+    logic [7:0]  gp_gm_cmd_dtype;
 
     gemm_ctrl #(
         .ARRAY_M     (16),
@@ -159,6 +169,10 @@ module onnx_sim_top
         .cmd_K        (gp_gm_cmd_K),
         .cmd_flags    (gp_gm_cmd_flags),
         .cmd_imm      (gp_gm_cmd_imm),
+        .cmd_dtype    (gp_gm_cmd_dtype),
+        .dtype_fp16   (gm_dtype_fp16),
+        .sa_a_col_fp16(gm_sa_a_col_fp16),
+        .sa_b_row_fp16(gm_sa_b_row_fp16),
         .sram_rd_en   (gm_rd_en),
         .sram_rd_addr (gm_rd_addr),
         .sram_rd_data (s0_a_dout),
@@ -188,12 +202,15 @@ module onnx_sim_top
     ) u_systolic (
         .clk       (clk),
         .rst_n     (rst_n),
-        .clear_acc (gm_sa_clear),
-        .en        (gm_sa_en),
-        .a_col     (gm_sa_a_col),
-        .b_row     (gm_sa_b_row),
-        .acc_out   (gm_sa_acc),
-        .acc_valid ()
+        .clear_acc  (gm_sa_clear),
+        .en         (gm_sa_en),
+        .dtype_fp16 (gm_dtype_fp16),
+        .a_col      (gm_sa_a_col),
+        .b_row      (gm_sa_b_row),
+        .a_col_fp16 (gm_sa_a_col_fp16),
+        .b_row_fp16 (gm_sa_b_row_fp16),
+        .acc_out    (gm_sa_acc),
+        .acc_valid  ()
     );
 
     // ACC SRAM (32-bit x 256 entries)
@@ -228,6 +245,7 @@ module onnx_sim_top
 
     logic        gp_sm_cmd_valid;
     logic [15:0] gp_sm_src_base, gp_sm_dst_base, gp_sm_length;
+    logic [7:0]  gp_sm_cmd_dtype;
 
     softmax_engine u_softmax (
         .clk             (clk),
@@ -240,6 +258,7 @@ module onnx_sim_top
         .scale_factor    (16'd256),
         .causal_mask_en  (1'b0),
         .causal_limit    (16'd0),
+        .cmd_dtype       (gp_sm_cmd_dtype),
         .sram_rd_en      (sm_rd_en),
         .sram_rd_addr    (sm_rd_addr),
         .sram_rd_data    (sm_rd_data),
@@ -314,6 +333,7 @@ module onnx_sim_top
     logic        gp_me_cmd_valid;
     logic [7:0]  gp_me_cmd_opcode;
     logic [15:0] gp_me_cmd_src_base, gp_me_cmd_dst_base, gp_me_cmd_length;
+    logic [7:0]  gp_me_cmd_dtype;
 
     math_engine #(.SRAM0_AW(SRAM0_AW)) u_math (
         .clk          (clk),
@@ -323,6 +343,7 @@ module onnx_sim_top
         .cmd_src_base (gp_me_cmd_src_base),
         .cmd_dst_base (gp_me_cmd_dst_base),
         .cmd_length   (gp_me_cmd_length),
+        .cmd_dtype    (gp_me_cmd_dtype),
         .sram_rd_en   (me_rd_en),
         .sram_rd_addr (me_rd_addr),
         .sram_rd_data (s0_a_dout),
@@ -461,6 +482,146 @@ module onnx_sim_top
     );
 
     // ================================================================
+    // Phase 4 Engines
+    // ================================================================
+
+    // --- MaxPool2D Engine ---
+    logic        mp_rd_en;
+    logic [SRAM0_AW-1:0] mp_rd_addr;
+    logic        mp_wr_en;
+    logic [SRAM0_AW-1:0] mp_wr_addr;
+    logic [7:0]  mp_wr_data;
+    logic        mp_done;
+
+    logic        mp_cmd_valid;
+    logic [15:0] mp_cmd_src_base, mp_cmd_dst_base;
+    logic [15:0] mp_cmd_C, mp_cmd_H, mp_cmd_W;
+    logic [7:0]  mp_cmd_kh, mp_cmd_kw, mp_cmd_sh, mp_cmd_sw;
+
+    maxpool2d_engine #(.SRAM0_AW(SRAM0_AW)) u_maxpool2d (
+        .clk           (clk),
+        .rst_n         (rst_n),
+        .cmd_valid     (mp_cmd_valid),
+        .cmd_src_base  (mp_cmd_src_base),
+        .cmd_dst_base  (mp_cmd_dst_base),
+        .cmd_C         (mp_cmd_C),
+        .cmd_H         (mp_cmd_H),
+        .cmd_W         (mp_cmd_W),
+        .cmd_kh        (mp_cmd_kh),
+        .cmd_kw        (mp_cmd_kw),
+        .cmd_sh        (mp_cmd_sh),
+        .cmd_sw        (mp_cmd_sw),
+        .sram_rd_en    (mp_rd_en),
+        .sram_rd_addr  (mp_rd_addr),
+        .sram_rd_data  (s0_a_dout),
+        .sram_wr_en    (mp_wr_en),
+        .sram_wr_addr  (mp_wr_addr),
+        .sram_wr_data  (mp_wr_data),
+        .busy          (),
+        .done          (mp_done)
+    );
+
+    // --- Pad Engine ---
+    logic        pd_rd_en;
+    logic [SRAM0_AW-1:0] pd_rd_addr;
+    logic        pd_wr_en;
+    logic [SRAM0_AW-1:0] pd_wr_addr;
+    logic [7:0]  pd_wr_data;
+    logic        pd_done;
+
+    logic        pd_cmd_valid;
+    logic [15:0] pd_cmd_src_base, pd_cmd_dst_base;
+    logic [15:0] pd_cmd_C, pd_cmd_H, pd_cmd_W;
+    logic [7:0]  pd_cmd_pad_top, pd_cmd_pad_bottom, pd_cmd_pad_left, pd_cmd_pad_right;
+
+    pad_engine #(.SRAM0_AW(SRAM0_AW)) u_pad (
+        .clk             (clk),
+        .rst_n           (rst_n),
+        .cmd_valid       (pd_cmd_valid),
+        .cmd_src_base    (pd_cmd_src_base),
+        .cmd_dst_base    (pd_cmd_dst_base),
+        .cmd_C           (pd_cmd_C),
+        .cmd_H           (pd_cmd_H),
+        .cmd_W           (pd_cmd_W),
+        .cmd_pad_top     (pd_cmd_pad_top),
+        .cmd_pad_bottom  (pd_cmd_pad_bottom),
+        .cmd_pad_left    (pd_cmd_pad_left),
+        .cmd_pad_right   (pd_cmd_pad_right),
+        .sram_rd_en      (pd_rd_en),
+        .sram_rd_addr    (pd_rd_addr),
+        .sram_rd_data    (s0_a_dout),
+        .sram_wr_en      (pd_wr_en),
+        .sram_wr_addr    (pd_wr_addr),
+        .sram_wr_data    (pd_wr_data),
+        .busy            (),
+        .done            (pd_done)
+    );
+
+    // --- Resize Nearest Engine ---
+    logic        rz_rd_en;
+    logic [SRAM0_AW-1:0] rz_rd_addr;
+    logic        rz_wr_en;
+    logic [SRAM0_AW-1:0] rz_wr_addr;
+    logic [7:0]  rz_wr_data;
+    logic        rz_done;
+
+    logic        rz_cmd_valid;
+    logic [15:0] rz_cmd_src_base, rz_cmd_dst_base;
+    logic [15:0] rz_cmd_C, rz_cmd_in_H, rz_cmd_in_W, rz_cmd_out_H, rz_cmd_out_W;
+
+    resize_nearest_engine #(.SRAM0_AW(SRAM0_AW)) u_resize_nearest (
+        .clk           (clk),
+        .rst_n         (rst_n),
+        .cmd_valid     (rz_cmd_valid),
+        .cmd_src_base  (rz_cmd_src_base),
+        .cmd_dst_base  (rz_cmd_dst_base),
+        .cmd_C         (rz_cmd_C),
+        .cmd_in_H      (rz_cmd_in_H),
+        .cmd_in_W      (rz_cmd_in_W),
+        .cmd_out_H     (rz_cmd_out_H),
+        .cmd_out_W     (rz_cmd_out_W),
+        .sram_rd_en    (rz_rd_en),
+        .sram_rd_addr  (rz_rd_addr),
+        .sram_rd_data  (s0_a_dout),
+        .sram_wr_en    (rz_wr_en),
+        .sram_wr_addr  (rz_wr_addr),
+        .sram_wr_data  (rz_wr_data),
+        .busy          (),
+        .done          (rz_done)
+    );
+
+    // --- Cast Engine ---
+    logic        ca_rd_en;
+    logic [SRAM0_AW-1:0] ca_rd_addr;
+    logic        ca_wr_en;
+    logic [SRAM0_AW-1:0] ca_wr_addr;
+    logic [7:0]  ca_wr_data;
+    logic        ca_done;
+
+    logic        ca_cmd_valid;
+    logic [15:0] ca_cmd_src_base, ca_cmd_dst_base, ca_cmd_length;
+    logic [7:0]  ca_cmd_src_dtype, ca_cmd_dst_dtype;
+
+    cast_engine #(.SRAM0_AW(SRAM0_AW)) u_cast (
+        .clk           (clk),
+        .rst_n         (rst_n),
+        .cmd_valid     (ca_cmd_valid),
+        .cmd_src_base  (ca_cmd_src_base),
+        .cmd_dst_base  (ca_cmd_dst_base),
+        .cmd_length    (ca_cmd_length),
+        .cmd_src_dtype (ca_cmd_src_dtype),
+        .cmd_dst_dtype (ca_cmd_dst_dtype),
+        .sram_rd_en    (ca_rd_en),
+        .sram_rd_addr  (ca_rd_addr),
+        .sram_rd_data  (s0_a_dout),
+        .sram_wr_en    (ca_wr_en),
+        .sram_wr_addr  (ca_wr_addr),
+        .sram_wr_data  (ca_wr_data),
+        .busy          (),
+        .done          (ca_done)
+    );
+
+    // ================================================================
     // Graph Pipeline (graph_top)
     // ================================================================
     logic        gp_ew_rd_en, gp_ew_wr_en;
@@ -484,6 +645,7 @@ module onnx_sim_top
     logic [31:0] gp_perf_total, gp_perf_gemm, gp_perf_softmax, gp_perf_dma;
     logic [31:0] gp_perf_reduce, gp_perf_math, gp_perf_gather;
     logic [31:0] gp_perf_slice, gp_perf_concat, gp_perf_avgpool, gp_perf_ew;
+    logic [31:0] gp_perf_overlap, gp_perf_stall;
 
     graph_top #(
         .PROG_SRAM_AW (PROG_AW),
@@ -493,6 +655,7 @@ module onnx_sim_top
         .rst_n         (rst_n),
         .start         (start_pulse),
         .prog_len      (prog_len),
+        .scheduler_mode(scheduler_mode),
         .prog_rd_en    (prog_rd_en),
         .prog_rd_addr  (prog_rd_addr),
         .prog_rd_data  (prog_rd_data),
@@ -512,12 +675,14 @@ module onnx_sim_top
         .gm_cmd_K      (gp_gm_cmd_K),
         .gm_cmd_flags  (gp_gm_cmd_flags),
         .gm_cmd_imm    (gp_gm_cmd_imm),
+        .gm_cmd_dtype  (gp_gm_cmd_dtype),
         .gm_done       (gm_done),
         // Softmax
         .sm_cmd_valid  (gp_sm_cmd_valid),
         .sm_src_base   (gp_sm_src_base),
         .sm_dst_base   (gp_sm_dst_base),
         .sm_length     (gp_sm_length),
+        .sm_cmd_dtype  (gp_sm_cmd_dtype),
         .sm_done       (sm_done),
         // Reduce
         .re_cmd_valid      (gp_re_cmd_valid),
@@ -533,6 +698,7 @@ module onnx_sim_top
         .me_cmd_src_base(gp_me_cmd_src_base),
         .me_cmd_dst_base(gp_me_cmd_dst_base),
         .me_cmd_length (gp_me_cmd_length),
+        .me_cmd_dtype  (gp_me_cmd_dtype),
         .me_done       (me_done),
         // Gather
         .ga_cmd_valid      (gp_ga_cmd_valid),
@@ -573,7 +739,48 @@ module onnx_sim_top
         .ap_cmd_sh        (ap_cmd_sh),
         .ap_cmd_sw        (ap_cmd_sw),
         .ap_done          (ap_done),
-        .perf_avgpool_cycles (gp_perf_avgpool),
+        // MaxPool2D (Phase 4)
+        .mp_cmd_valid     (mp_cmd_valid),
+        .mp_cmd_src_base  (mp_cmd_src_base),
+        .mp_cmd_dst_base  (mp_cmd_dst_base),
+        .mp_cmd_C         (mp_cmd_C),
+        .mp_cmd_H         (mp_cmd_H),
+        .mp_cmd_W         (mp_cmd_W),
+        .mp_cmd_kh        (mp_cmd_kh),
+        .mp_cmd_kw        (mp_cmd_kw),
+        .mp_cmd_sh        (mp_cmd_sh),
+        .mp_cmd_sw        (mp_cmd_sw),
+        .mp_done          (mp_done),
+        // Pad (Phase 4)
+        .pd_cmd_valid     (pd_cmd_valid),
+        .pd_cmd_src_base  (pd_cmd_src_base),
+        .pd_cmd_dst_base  (pd_cmd_dst_base),
+        .pd_cmd_C         (pd_cmd_C),
+        .pd_cmd_H         (pd_cmd_H),
+        .pd_cmd_W         (pd_cmd_W),
+        .pd_cmd_pad_top   (pd_cmd_pad_top),
+        .pd_cmd_pad_bottom(pd_cmd_pad_bottom),
+        .pd_cmd_pad_left  (pd_cmd_pad_left),
+        .pd_cmd_pad_right (pd_cmd_pad_right),
+        .pd_done          (pd_done),
+        // Resize nearest (Phase 4)
+        .rz_cmd_valid     (rz_cmd_valid),
+        .rz_cmd_src_base  (rz_cmd_src_base),
+        .rz_cmd_dst_base  (rz_cmd_dst_base),
+        .rz_cmd_C         (rz_cmd_C),
+        .rz_cmd_in_H      (rz_cmd_in_H),
+        .rz_cmd_in_W      (rz_cmd_in_W),
+        .rz_cmd_out_H     (rz_cmd_out_H),
+        .rz_cmd_out_W     (rz_cmd_out_W),
+        .rz_done          (rz_done),
+        // Cast (Phase 4)
+        .ca_cmd_valid     (ca_cmd_valid),
+        .ca_cmd_src_base  (ca_cmd_src_base),
+        .ca_cmd_dst_base  (ca_cmd_dst_base),
+        .ca_cmd_length    (ca_cmd_length),
+        .ca_cmd_src_dtype (ca_cmd_src_dtype),
+        .ca_cmd_dst_dtype (ca_cmd_dst_dtype),
+        .ca_done          (ca_done),
         // DMA
         .dma_cmd_valid (gp_dma_cmd_valid),
         .dma_ddr_addr  (gp_dma_ddr_addr),
@@ -603,7 +810,10 @@ module onnx_sim_top
         .perf_gather_cycles (gp_perf_gather),
         .perf_slice_cycles  (gp_perf_slice),
         .perf_concat_cycles (gp_perf_concat),
+        .perf_avgpool_cycles(gp_perf_avgpool),
         .perf_ew_cycles     (gp_perf_ew),
+        .perf_overlap_cycles(gp_perf_overlap),
+        .perf_stall_cycles  (gp_perf_stall),
         // Status
         .graph_done    (gp_done),
         .graph_busy    (gp_busy),
@@ -669,7 +879,8 @@ module onnx_sim_top
 
     // ================================================================
     // DATA SRAM0 (8-bit x SRAM0_DEPTH)
-    // Mux priority: gp_ew > gm > sm > re > me > ga > sl > ct > ap > tb
+    // Phase 4: Mux uses rd_en/wr_en instead of busy for arbitration
+    // Priority: gp_ew > gm > sm > re > me > ga > sl > ct > ap > mp > pd > rz > ca > tb
     // ================================================================
     logic                 s0_a_en;
     logic [SRAM0_AW-1:0] s0_a_addr;
@@ -678,81 +889,93 @@ module onnx_sim_top
     logic [SRAM0_AW-1:0] s0_b_addr;
     logic [7:0]           s0_b_din;
 
-    // SRAM0 read mux (port A)
+    // SRAM0 read mux (port A) - uses rd_en signals for overlap
     always_comb begin
-        if (gp_ew_busy && gp_ew_rd_en) begin
+        if (gp_ew_rd_en) begin
             s0_a_en   = 1'b1;
             s0_a_addr = gp_ew_rd_addr;
-        end else if (gm_busy) begin
-            s0_a_en   = gm_rd_en;
+        end else if (gm_rd_en) begin
+            s0_a_en   = 1'b1;
             s0_a_addr = gm_rd_addr[SRAM0_AW-1:0];
-        end else if (sm_busy) begin
-            s0_a_en   = sm_rd_en;
+        end else if (sm_rd_en) begin
+            s0_a_en   = 1'b1;
             s0_a_addr = sm_rd_addr[SRAM0_AW-1:0];
-        end else if (re_busy) begin
-            s0_a_en   = re_rd_en;
+        end else if (re_rd_en) begin
+            s0_a_en   = 1'b1;
             s0_a_addr = re_rd_addr;
-        end else if (me_busy) begin
-            s0_a_en   = me_rd_en;
+        end else if (me_rd_en) begin
+            s0_a_en   = 1'b1;
             s0_a_addr = me_rd_addr;
-        end else if (ga_busy) begin
-            s0_a_en   = ga_rd_en;
+        end else if (ga_rd_en) begin
+            s0_a_en   = 1'b1;
             s0_a_addr = ga_rd_addr;
-        end else if (sl_busy) begin
-            s0_a_en   = sl_rd_en;
+        end else if (sl_rd_en) begin
+            s0_a_en   = 1'b1;
             s0_a_addr = sl_rd_addr;
-        end else if (ct_busy) begin
-            s0_a_en   = ct_rd_en;
+        end else if (ct_rd_en) begin
+            s0_a_en   = 1'b1;
             s0_a_addr = ct_rd_addr;
         end else if (ap_rd_en) begin
             s0_a_en   = 1'b1;
             s0_a_addr = ap_rd_addr;
+        end else if (mp_rd_en) begin
+            s0_a_en   = 1'b1;
+            s0_a_addr = mp_rd_addr;
+        end else if (pd_rd_en) begin
+            s0_a_en   = 1'b1;
+            s0_a_addr = pd_rd_addr;
+        end else if (rz_rd_en) begin
+            s0_a_en   = 1'b1;
+            s0_a_addr = rz_rd_addr;
+        end else if (ca_rd_en) begin
+            s0_a_en   = 1'b1;
+            s0_a_addr = ca_rd_addr;
         end else begin
             s0_a_en   = tb_sram0_rd_en;
             s0_a_addr = tb_sram0_rd_addr;
         end
     end
 
-    // SRAM0 write mux (port B)
+    // SRAM0 write mux (port B) - uses wr_en signals for overlap
     always_comb begin
-        if (gp_ew_busy && gp_ew_wr_en) begin
+        if (gp_ew_wr_en) begin
             s0_b_en   = 1'b1;
             s0_b_we   = 1'b1;
             s0_b_addr = gp_ew_wr_addr;
             s0_b_din  = gp_ew_wr_data;
-        end else if (gm_busy) begin
-            s0_b_en   = gm_wr_en;
-            s0_b_we   = gm_wr_en;
+        end else if (gm_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
             s0_b_addr = gm_wr_addr[SRAM0_AW-1:0];
             s0_b_din  = gm_wr_data;
-        end else if (sm_busy) begin
-            s0_b_en   = sm_wr_en;
-            s0_b_we   = sm_wr_en;
+        end else if (sm_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
             s0_b_addr = sm_wr_addr[SRAM0_AW-1:0];
             s0_b_din  = sm_wr_data;
-        end else if (re_busy) begin
-            s0_b_en   = re_wr_en;
-            s0_b_we   = re_wr_en;
+        end else if (re_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
             s0_b_addr = re_wr_addr;
             s0_b_din  = re_wr_data;
-        end else if (me_busy) begin
-            s0_b_en   = me_wr_en;
-            s0_b_we   = me_wr_en;
+        end else if (me_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
             s0_b_addr = me_wr_addr;
             s0_b_din  = me_wr_data;
-        end else if (ga_busy) begin
-            s0_b_en   = ga_wr_en;
-            s0_b_we   = ga_wr_en;
+        end else if (ga_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
             s0_b_addr = ga_wr_addr;
             s0_b_din  = ga_wr_data;
-        end else if (sl_busy) begin
-            s0_b_en   = sl_wr_en;
-            s0_b_we   = sl_wr_en;
+        end else if (sl_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
             s0_b_addr = sl_wr_addr;
             s0_b_din  = sl_wr_data;
-        end else if (ct_busy) begin
-            s0_b_en   = ct_wr_en;
-            s0_b_we   = ct_wr_en;
+        end else if (ct_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
             s0_b_addr = ct_wr_addr;
             s0_b_din  = ct_wr_data;
         end else if (ap_wr_en) begin
@@ -760,6 +983,26 @@ module onnx_sim_top
             s0_b_we   = 1'b1;
             s0_b_addr = ap_wr_addr;
             s0_b_din  = ap_wr_data;
+        end else if (mp_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
+            s0_b_addr = mp_wr_addr;
+            s0_b_din  = mp_wr_data;
+        end else if (pd_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
+            s0_b_addr = pd_wr_addr;
+            s0_b_din  = pd_wr_data;
+        end else if (rz_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
+            s0_b_addr = rz_wr_addr;
+            s0_b_din  = rz_wr_data;
+        end else if (ca_wr_en) begin
+            s0_b_en   = 1'b1;
+            s0_b_we   = 1'b1;
+            s0_b_addr = ca_wr_addr;
+            s0_b_din  = ca_wr_data;
         end else begin
             s0_b_en   = tb_sram0_wr_en;
             s0_b_we   = tb_sram0_wr_en;
@@ -807,6 +1050,8 @@ module onnx_sim_top
     assign perf_concat_cycles  = gp_perf_concat;
     assign perf_avgpool_cycles = gp_perf_avgpool;
     assign perf_ew_cycles      = gp_perf_ew;
+    assign perf_overlap_cycles = gp_perf_overlap;
+    assign perf_stall_cycles   = gp_perf_stall;
 
 endmodule
 

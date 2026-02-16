@@ -36,6 +36,21 @@ package graph_isa_pkg;
     parameter logic [7:0] OP_G_PAD          = 8'h6A;
     parameter logic [7:0] OP_G_AVGPOOL2D    = 8'h70;
 
+    // Phase 4 opcodes
+    parameter logic [7:0] OP_G_MAXPOOL2D       = 8'h71;
+    parameter logic [7:0] OP_G_RESIZE_NEAREST  = 8'h72;
+    parameter logic [7:0] OP_G_PREFETCH        = 8'h78;
+    parameter logic [7:0] OP_G_EW_MIN          = 8'h39;
+    parameter logic [7:0] OP_G_EW_MAX          = 8'h3A;
+    parameter logic [7:0] OP_G_CAST            = 8'h7A;
+
+    // =========================================================================
+    // Dtype constants
+    // =========================================================================
+    parameter logic [7:0] DTYPE_INT8  = 8'h00;
+    parameter logic [7:0] DTYPE_FP16  = 8'h01;
+    parameter logic [7:0] DTYPE_INT32 = 8'h02;
+
     // =========================================================================
     // Graph ISA Instruction Format (128-bit)
     //   word0[31:0]:  { src0[7:0], dst[7:0], flags[7:0], opcode[7:0] }

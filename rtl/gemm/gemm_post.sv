@@ -1,11 +1,13 @@
 // =============================================================================
 // GEMM Post-Processing: Bias add, requantize, ReLU, write back
+// Supports INT8 (full pipeline) and FP16 (bypass requantize)
 // =============================================================================
 `default_nettype none
 
 module gemm_post
     import npu_pkg::*;
     import isa_pkg::*;
+    import fp16_utils_pkg::*;
 #(
     parameter int ARRAY_M = 16,
     parameter int ARRAY_N = 16,
@@ -21,6 +23,7 @@ module gemm_post
     input  wire  [7:0]                   flags,
     input  wire  [7:0]                   scale,
     input  wire  [7:0]                   shift,
+    input  wire                          dtype,     // 0=INT8, 1=FP16
 
     // ACC SRAM read
     output logic                         acc_rd_en,
@@ -55,6 +58,7 @@ module gemm_post
     logic [15:0] elem_cnt, total_elems;
     logic [15:0] base_addr, dst_addr;
     logic bias_en, requant_en, relu_en;
+    logic r_dtype;
     logic signed [ACC_W-1:0] acc_val;
     logic signed [ACC_W-1:0] biased;
     logic signed [DATA_W-1:0] result;
@@ -92,7 +96,6 @@ module gemm_post
             end
 
             PP_WAIT: begin
-                // 1-cycle SRAM read latency
                 if (acc_rd_valid)
                     pp_state_next = PP_PROCESS;
             end
@@ -130,6 +133,7 @@ module gemm_post
             bias_en      <= 1'b0;
             requant_en   <= 1'b0;
             relu_en      <= 1'b0;
+            r_dtype      <= 1'b0;
             acc_val      <= '0;
             biased       <= '0;
             result       <= '0;
@@ -144,6 +148,7 @@ module gemm_post
                         bias_en     <= flags[FLAG_BIAS_EN];
                         requant_en  <= flags[FLAG_REQUANT];
                         relu_en     <= flags[FLAG_RELU];
+                        r_dtype     <= dtype;
                     end
                 end
 
@@ -153,16 +158,25 @@ module gemm_post
                 end
 
                 PP_PROCESS: begin
-                    // Bias add
-                    biased = bias_en ? sat_add_i32(acc_val, bias_data) : acc_val;
-                    // Requantize
-                    if (requant_en)
-                        result <= requantize(biased, scale, shift);
-                    else
-                        result <= saturate_i8(biased);
-                    // ReLU
-                    if (relu_en && result < 0)
-                        result <= '0;
+                    if (r_dtype) begin
+                        // FP16 bypass: convert FP32 acc to FP16, output lower 8 bits
+                        // (FP16 store is primarily handled by gemm_ctrl directly)
+                        begin
+                            logic [15:0] fp16_tmp;
+                            fp16_tmp = fp32_to_fp16(acc_val);
+                            result <= signed'(fp16_tmp[7:0]);
+                        end
+                    end else begin
+                        // INT8 path: bias add + requantize
+                        biased = bias_en ? sat_add_i32(acc_val, bias_data) : acc_val;
+                        if (requant_en)
+                            result <= requantize(biased, scale, shift);
+                        else
+                            result <= saturate_i8(biased);
+                        // ReLU
+                        if (relu_en && result < 0)
+                            result <= '0;
+                    end
                 end
 
                 PP_WRITE: begin

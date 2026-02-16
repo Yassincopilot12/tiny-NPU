@@ -3,6 +3,8 @@
 // Connects: graph_fetch → graph_decode → graph_dispatch
 // Exposes engine/DMA/SRAM/debug ports to parent sim wrapper
 // Phase 3: adds reduce/math/gather/slice/concat/avgpool engine ports + perf counters
+// Phase 4: adds scheduler_mode, maxpool/pad/resize/cast engine ports, dtype outputs,
+//          overlap/stall perf counters
 // =============================================================================
 `default_nettype none
 
@@ -19,6 +21,7 @@ module graph_top
     // Control
     input  wire                     start,
     input  wire  [15:0]             prog_len,
+    input  wire                     scheduler_mode,  // 0=SERIAL, 1=OVERLAP
 
     // Program SRAM read port
     output logic                    prog_rd_en,
@@ -43,6 +46,7 @@ module graph_top
     output logic [15:0]             gm_cmd_K,
     output logic [7:0]              gm_cmd_flags,
     output logic [15:0]             gm_cmd_imm,
+    output logic [7:0]              gm_cmd_dtype,
     input  wire                     gm_done,
 
     // Softmax engine command
@@ -50,6 +54,7 @@ module graph_top
     output logic [15:0]             sm_src_base,
     output logic [15:0]             sm_dst_base,
     output logic [15:0]             sm_length,
+    output logic [7:0]              sm_cmd_dtype,
     input  wire                     sm_done,
 
     // Reduce engine command
@@ -67,6 +72,7 @@ module graph_top
     output logic [15:0]             me_cmd_src_base,
     output logic [15:0]             me_cmd_dst_base,
     output logic [15:0]             me_cmd_length,
+    output logic [7:0]              me_cmd_dtype,
     input  wire                     me_done,
 
     // Gather engine command
@@ -112,6 +118,52 @@ module graph_top
     output logic [7:0]              ap_cmd_sw,
     input  wire                     ap_done,
 
+    // MaxPool2D engine command (Phase 4)
+    output logic                    mp_cmd_valid,
+    output logic [15:0]             mp_cmd_src_base,
+    output logic [15:0]             mp_cmd_dst_base,
+    output logic [15:0]             mp_cmd_C,
+    output logic [15:0]             mp_cmd_H,
+    output logic [15:0]             mp_cmd_W,
+    output logic [7:0]              mp_cmd_kh,
+    output logic [7:0]              mp_cmd_kw,
+    output logic [7:0]              mp_cmd_sh,
+    output logic [7:0]              mp_cmd_sw,
+    input  wire                     mp_done,
+
+    // Pad engine command (Phase 4)
+    output logic                    pd_cmd_valid,
+    output logic [15:0]             pd_cmd_src_base,
+    output logic [15:0]             pd_cmd_dst_base,
+    output logic [15:0]             pd_cmd_C,
+    output logic [15:0]             pd_cmd_H,
+    output logic [15:0]             pd_cmd_W,
+    output logic [7:0]              pd_cmd_pad_top,
+    output logic [7:0]              pd_cmd_pad_bottom,
+    output logic [7:0]              pd_cmd_pad_left,
+    output logic [7:0]              pd_cmd_pad_right,
+    input  wire                     pd_done,
+
+    // Resize nearest engine command (Phase 4)
+    output logic                    rz_cmd_valid,
+    output logic [15:0]             rz_cmd_src_base,
+    output logic [15:0]             rz_cmd_dst_base,
+    output logic [15:0]             rz_cmd_C,
+    output logic [15:0]             rz_cmd_in_H,
+    output logic [15:0]             rz_cmd_in_W,
+    output logic [15:0]             rz_cmd_out_H,
+    output logic [15:0]             rz_cmd_out_W,
+    input  wire                     rz_done,
+
+    // Cast engine command (Phase 4)
+    output logic                    ca_cmd_valid,
+    output logic [15:0]             ca_cmd_src_base,
+    output logic [15:0]             ca_cmd_dst_base,
+    output logic [15:0]             ca_cmd_length,
+    output logic [7:0]              ca_cmd_src_dtype,
+    output logic [7:0]              ca_cmd_dst_dtype,
+    input  wire                     ca_done,
+
     // DMA shim
     output logic                    dma_cmd_valid,
     output logic [31:0]             dma_ddr_addr,
@@ -147,6 +199,8 @@ module graph_top
     output logic [31:0]             perf_concat_cycles,
     output logic [31:0]             perf_avgpool_cycles,
     output logic [31:0]             perf_ew_cycles,
+    output logic [31:0]             perf_overlap_cycles,
+    output logic [31:0]             perf_stall_cycles,
 
     // Status / debug
     output logic                    graph_done,
@@ -217,6 +271,7 @@ module graph_top
         .clk           (clk),
         .rst_n         (rst_n),
         .start         (start),
+        .scheduler_mode(scheduler_mode),
         .instr_valid   (decoded_valid),
         .instr_in      (decoded_instr),
         .instr_ready   (fetch_instr_ready),
@@ -236,12 +291,14 @@ module graph_top
         .gm_cmd_K      (gm_cmd_K),
         .gm_cmd_flags  (gm_cmd_flags),
         .gm_cmd_imm    (gm_cmd_imm),
+        .gm_cmd_dtype  (gm_cmd_dtype),
         .gm_done       (gm_done),
         // Softmax
         .sm_cmd_valid  (sm_cmd_valid),
         .sm_src_base   (sm_src_base),
         .sm_dst_base   (sm_dst_base),
         .sm_length     (sm_length),
+        .sm_cmd_dtype  (sm_cmd_dtype),
         .sm_done       (sm_done),
         // Reduce
         .re_cmd_valid      (re_cmd_valid),
@@ -257,6 +314,7 @@ module graph_top
         .me_cmd_src_base(me_cmd_src_base),
         .me_cmd_dst_base(me_cmd_dst_base),
         .me_cmd_length (me_cmd_length),
+        .me_cmd_dtype  (me_cmd_dtype),
         .me_done       (me_done),
         // Gather
         .ga_cmd_valid      (ga_cmd_valid),
@@ -297,6 +355,48 @@ module graph_top
         .ap_cmd_sh         (ap_cmd_sh),
         .ap_cmd_sw         (ap_cmd_sw),
         .ap_done           (ap_done),
+        // MaxPool2D (Phase 4)
+        .mp_cmd_valid      (mp_cmd_valid),
+        .mp_cmd_src_base   (mp_cmd_src_base),
+        .mp_cmd_dst_base   (mp_cmd_dst_base),
+        .mp_cmd_C          (mp_cmd_C),
+        .mp_cmd_H          (mp_cmd_H),
+        .mp_cmd_W          (mp_cmd_W),
+        .mp_cmd_kh         (mp_cmd_kh),
+        .mp_cmd_kw         (mp_cmd_kw),
+        .mp_cmd_sh         (mp_cmd_sh),
+        .mp_cmd_sw         (mp_cmd_sw),
+        .mp_done           (mp_done),
+        // Pad (Phase 4)
+        .pd_cmd_valid      (pd_cmd_valid),
+        .pd_cmd_src_base   (pd_cmd_src_base),
+        .pd_cmd_dst_base   (pd_cmd_dst_base),
+        .pd_cmd_C          (pd_cmd_C),
+        .pd_cmd_H          (pd_cmd_H),
+        .pd_cmd_W          (pd_cmd_W),
+        .pd_cmd_pad_top    (pd_cmd_pad_top),
+        .pd_cmd_pad_bottom (pd_cmd_pad_bottom),
+        .pd_cmd_pad_left   (pd_cmd_pad_left),
+        .pd_cmd_pad_right  (pd_cmd_pad_right),
+        .pd_done           (pd_done),
+        // Resize nearest (Phase 4)
+        .rz_cmd_valid      (rz_cmd_valid),
+        .rz_cmd_src_base   (rz_cmd_src_base),
+        .rz_cmd_dst_base   (rz_cmd_dst_base),
+        .rz_cmd_C          (rz_cmd_C),
+        .rz_cmd_in_H       (rz_cmd_in_H),
+        .rz_cmd_in_W       (rz_cmd_in_W),
+        .rz_cmd_out_H      (rz_cmd_out_H),
+        .rz_cmd_out_W      (rz_cmd_out_W),
+        .rz_done           (rz_done),
+        // Cast (Phase 4)
+        .ca_cmd_valid      (ca_cmd_valid),
+        .ca_cmd_src_base   (ca_cmd_src_base),
+        .ca_cmd_dst_base   (ca_cmd_dst_base),
+        .ca_cmd_length     (ca_cmd_length),
+        .ca_cmd_src_dtype  (ca_cmd_src_dtype),
+        .ca_cmd_dst_dtype  (ca_cmd_dst_dtype),
+        .ca_done           (ca_done),
         // DMA
         .dma_cmd_valid (dma_cmd_valid),
         .dma_ddr_addr  (dma_ddr_addr),
@@ -327,6 +427,8 @@ module graph_top
         .perf_concat_cycles (perf_concat_cycles),
         .perf_avgpool_cycles(perf_avgpool_cycles),
         .perf_ew_cycles     (perf_ew_cycles),
+        .perf_overlap_cycles(perf_overlap_cycles),
+        .perf_stall_cycles  (perf_stall_cycles),
         // Status
         .graph_done    (disp_done),
         .graph_busy    (disp_busy),

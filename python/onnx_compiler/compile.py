@@ -60,6 +60,19 @@ OP_G_CONCAT      = 0x69
 OP_G_PAD         = 0x6A
 OP_G_AVGPOOL2D   = 0x70
 
+# Phase 4 opcodes
+OP_G_MAXPOOL2D      = 0x71
+OP_G_RESIZE_NEAREST = 0x72
+OP_G_PREFETCH       = 0x78
+OP_G_EW_MIN         = 0x39
+OP_G_EW_MAX         = 0x3A
+OP_G_CAST           = 0x7A
+
+# Dtype constants
+DTYPE_INT8  = 0x00
+DTYPE_FP16  = 0x01
+DTYPE_INT32 = 0x02
+
 GFLAG_TRANSPOSE_B = 0x01
 GFLAG_BIAS_EN     = 0x02
 GFLAG_REQUANT     = 0x04
@@ -416,6 +429,14 @@ class GraphCompiler:
                 self._lower_batchnorm(op, quant_data, current_data, tensor_shapes)
             elif op_type == 'AveragePool':
                 self._lower_avgpool2d(op, quant_data, current_data, tensor_shapes)
+            elif op_type == 'MaxPool':
+                self._lower_maxpool2d(op, quant_data, current_data, tensor_shapes)
+            elif op_type == 'Pad':
+                self._lower_pad(op, quant_data, current_data, tensor_shapes)
+            elif op_type == 'Resize':
+                self._lower_resize_nearest(op, quant_data, current_data, tensor_shapes)
+            elif op_type == 'Clip':
+                self._lower_clip(op, quant_data, current_data, tensor_shapes)
             else:
                 print(f"WARNING: Unsupported op '{op_type}', skipping")
 
@@ -583,6 +604,14 @@ class GraphCompiler:
         out_size = in_size
         tensor_shapes[output_name] = in_shape
         self.sram_allocs[output_name] = (out_sram, out_size)
+
+        # Transfer planner allocation from input to output so the free loop
+        # (which frees the Relu input after this op) won't return the memory
+        # to the free list while the aliased output is still live.
+        if self.use_reuse and self.mem_planner is not None:
+            if input_name in self.mem_planner.allocs:
+                alloc_entry = self.mem_planner.allocs.pop(input_name)
+                self.mem_planner.allocs[output_name] = alloc_entry
 
         out_id = self._add_tdesc(output_name, 0, out_sram, out_size,
                                 list(in_shape), len(in_shape))
@@ -1149,6 +1178,217 @@ class GraphCompiler:
         self.sram_live.add(output_name)
         current_data[output_name] = None
 
+    def _lower_maxpool2d(self, op, quant_data, current_data, tensor_shapes):
+        """Lower MaxPool via maxpool2d_engine."""
+        input_name = op.input[0]
+        output_name = op.output[0]
+
+        kernel_shape = [2, 2]
+        strides = [2, 2]
+        for attr in op.attribute:
+            if attr.name == 'kernel_shape':
+                kernel_shape = list(attr.ints)
+            elif attr.name == 'strides':
+                strides = list(attr.ints)
+
+        kh, kw = kernel_shape
+        sh, sw = strides
+
+        in_shape = tensor_shapes.get(input_name, (1, 1, 1, 1))
+        if len(in_shape) != 4:
+            print(f"WARNING: MaxPool input shape is not 4D: {in_shape}")
+            return
+        N, C, H, W_dim = in_shape
+
+        in_id = self.tdesc_id[input_name]
+        if input_name not in self.sram_live:
+            self._emit(encode_instr(OP_G_DMA_LOAD, src0=in_id))
+            self.sram_live.add(input_name)
+
+        out_h = (H - kh) // sh + 1
+        out_w = (W_dim - kw) // sw + 1
+        out_shape = [N, C, out_h, out_w]
+        out_size = int(np.prod(out_shape))
+
+        out_sram = self._alloc_sram(output_name, out_size)
+        tensor_shapes[output_name] = tuple(out_shape)
+        out_id = self._add_tdesc(output_name, 0, out_sram, out_size,
+                                list(out_shape), len(out_shape))
+
+        imm0 = ((kh & 0xFF) << 8) | (kw & 0xFF)
+        imm1 = ((sh & 0xFF) << 8) | (sw & 0xFF)
+
+        self._emit(encode_instr(OP_G_MAXPOOL2D, src0=in_id, dst=out_id,
+                                imm0=imm0, imm1=imm1))
+
+        self.sram_live.add(output_name)
+        current_data[output_name] = None
+
+    def _lower_pad(self, op, quant_data, current_data, tensor_shapes):
+        """Lower Pad (constant mode) via pad_engine."""
+        input_name = op.input[0]
+        output_name = op.output[0]
+
+        in_shape = tensor_shapes.get(input_name, (1,))
+        in_id = self.tdesc_id[input_name]
+        if input_name not in self.sram_live:
+            self._emit(encode_instr(OP_G_DMA_LOAD, src0=in_id))
+            self.sram_live.add(input_name)
+
+        # Get pads from inputs or attributes
+        pads = [0] * (2 * len(in_shape))
+        if len(op.input) > 1 and op.input[1] in self.initializers:
+            pads = self.initializers[op.input[1]].flatten().astype(int).tolist()
+        else:
+            for attr in op.attribute:
+                if attr.name == 'pads':
+                    pads = list(attr.ints)
+
+        # For NCHW: pads = [N_begin, C_begin, H_begin, W_begin, N_end, C_end, H_end, W_end]
+        # We only support spatial padding (H, W dims)
+        if len(in_shape) == 4:
+            pad_top = pads[2] if len(pads) > 2 else 0
+            pad_left = pads[3] if len(pads) > 3 else 0
+            pad_bottom = pads[6] if len(pads) > 6 else 0
+            pad_right = pads[7] if len(pads) > 7 else 0
+            N, C, H, W_dim = in_shape
+        elif len(in_shape) == 2:
+            pad_top = pads[0] if len(pads) > 0 else 0
+            pad_left = pads[1] if len(pads) > 1 else 0
+            pad_bottom = pads[2] if len(pads) > 2 else 0
+            pad_right = pads[3] if len(pads) > 3 else 0
+            N, C, H, W_dim = 1, 1, in_shape[0], in_shape[1]
+        else:
+            print(f"WARNING: Pad only supports 2D/4D tensors, got shape {in_shape}")
+            return
+
+        out_H = H + pad_top + pad_bottom
+        out_W = W_dim + pad_left + pad_right
+        if len(in_shape) == 4:
+            out_shape = [N, C, out_H, out_W]
+        else:
+            out_shape = [out_H, out_W]
+        out_size = int(np.prod(out_shape))
+
+        out_sram = self._alloc_sram(output_name, out_size)
+        tensor_shapes[output_name] = tuple(out_shape)
+        out_id = self._add_tdesc(output_name, 0, out_sram, out_size,
+                                list(out_shape), len(out_shape))
+
+        # Encode: imm0 = (pad_top << 8) | pad_bottom, imm1 = (pad_left << 8) | pad_right
+        imm0 = ((pad_top & 0xFF) << 8) | (pad_bottom & 0xFF)
+        imm1 = ((pad_left & 0xFF) << 8) | (pad_right & 0xFF)
+
+        self._emit(encode_instr(OP_G_PAD, src0=in_id, dst=out_id,
+                                imm0=imm0, imm1=imm1))
+
+        self.sram_live.add(output_name)
+        current_data[output_name] = None
+
+    def _lower_resize_nearest(self, op, quant_data, current_data, tensor_shapes):
+        """Lower Resize (nearest neighbor) via resize_nearest_engine."""
+        input_name = op.input[0]
+        output_name = op.output[0]
+
+        in_shape = tensor_shapes.get(input_name, (1, 1, 1, 1))
+        in_id = self.tdesc_id[input_name]
+        if input_name not in self.sram_live:
+            self._emit(encode_instr(OP_G_DMA_LOAD, src0=in_id))
+            self.sram_live.add(input_name)
+
+        # Get output shape from sizes or scales
+        if len(in_shape) != 4:
+            print(f"WARNING: Resize only supports 4D NCHW tensors")
+            return
+        N, C, H, W_dim = in_shape
+
+        # Check for 'sizes' input (index 3)
+        out_H, out_W = H * 2, W_dim * 2  # default 2x upsample
+        if len(op.input) > 3 and op.input[3] in self.initializers:
+            sizes = self.initializers[op.input[3]].flatten().astype(int).tolist()
+            if len(sizes) == 4:
+                out_H, out_W = sizes[2], sizes[3]
+        elif len(op.input) > 2 and op.input[2] in self.initializers:
+            scales = self.initializers[op.input[2]].flatten().astype(float).tolist()
+            if len(scales) == 4:
+                out_H = int(H * scales[2])
+                out_W = int(W_dim * scales[3])
+
+        out_shape = [N, C, out_H, out_W]
+        out_size = int(np.prod(out_shape))
+
+        out_sram = self._alloc_sram(output_name, out_size)
+        tensor_shapes[output_name] = tuple(out_shape)
+        out_id = self._add_tdesc(output_name, 0, out_sram, out_size,
+                                list(out_shape), len(out_shape))
+
+        # Encode: imm0 = (in_H << 8) | in_W, imm1 = (out_H << 8) | out_W
+        imm0 = ((H & 0xFF) << 8) | (W_dim & 0xFF)
+        imm1 = ((out_H & 0xFF) << 8) | (out_W & 0xFF)
+
+        self._emit(encode_instr(OP_G_RESIZE_NEAREST, src0=in_id, dst=out_id,
+                                imm0=imm0, imm1=imm1))
+
+        self.sram_live.add(output_name)
+        current_data[output_name] = None
+
+    def _lower_clip(self, op, quant_data, current_data, tensor_shapes):
+        """Lower Clip to EW_MAX(min) + EW_MIN(max)."""
+        input_name = op.input[0]
+        output_name = op.output[0]
+
+        in_shape = tensor_shapes.get(input_name, (1,))
+        in_id = self.tdesc_id[input_name]
+        if input_name not in self.sram_live:
+            self._emit(encode_instr(OP_G_DMA_LOAD, src0=in_id))
+            self.sram_live.add(input_name)
+
+        in_sram, in_size = self.sram_allocs[input_name]
+
+        # Get min/max values
+        clip_min = -128
+        clip_max = 127
+        if len(op.input) > 1 and op.input[1] in self.initializers:
+            clip_min = int(np.clip(self.initializers[op.input[1]].flat[0], -128, 127))
+        if len(op.input) > 2 and op.input[2] in self.initializers:
+            clip_max = int(np.clip(self.initializers[op.input[2]].flat[0], -128, 127))
+
+        # Create broadcast tensors for min/max
+        min_arr = np.full(in_size, clip_min, dtype=np.int8)
+        min_name = output_name + '_clip_min'
+        min_ddr = self._alloc_ddr(min_name, min_arr.tobytes())
+        min_sram = self._alloc_sram(min_name, in_size)
+        min_id = self._add_tdesc(min_name, min_ddr, min_sram, in_size,
+                                list(in_shape), len(in_shape))
+        self._emit(encode_instr(OP_G_DMA_LOAD, src0=min_id))
+
+        # EW_MAX(input, min_val) -> temp
+        temp_name = output_name + '_clip_temp'
+        temp_sram = self._alloc_sram(temp_name, in_size)
+        temp_id = self._add_tdesc(temp_name, 0, temp_sram, in_size,
+                                 list(in_shape), len(in_shape))
+        self.sram_allocs[temp_name] = (temp_sram, in_size)
+        self._emit(encode_instr(OP_G_EW_MAX, src0=in_id, src1=min_id, dst=temp_id))
+
+        max_arr = np.full(in_size, clip_max, dtype=np.int8)
+        max_name = output_name + '_clip_max'
+        max_ddr = self._alloc_ddr(max_name, max_arr.tobytes())
+        max_sram = self._alloc_sram(max_name, in_size)
+        max_id = self._add_tdesc(max_name, max_ddr, max_sram, in_size,
+                                list(in_shape), len(in_shape))
+        self._emit(encode_instr(OP_G_DMA_LOAD, src0=max_id))
+
+        # EW_MIN(temp, max_val) -> output
+        out_sram = self._alloc_sram(output_name, in_size)
+        tensor_shapes[output_name] = in_shape
+        out_id = self._add_tdesc(output_name, 0, out_sram, in_size,
+                                list(in_shape), len(in_shape))
+        self.sram_allocs[output_name] = (out_sram, in_size)
+        self._emit(encode_instr(OP_G_EW_MIN, src0=temp_id, src1=max_id, dst=out_id))
+
+        self.sram_live.add(output_name)
+        current_data[output_name] = None
+
     def _compute_golden(self, ops, quant_data, current_data, tensor_shapes):
         """Compute golden output using pure int8 arithmetic."""
         input_name = self.graph.input[0].name
@@ -1457,6 +1697,100 @@ class GraphCompiler:
 
                 tensors[op.output[0]] = result.flatten().astype(np.int8)
                 tensor_shapes[op.output[0]] = (N, C, out_h, out_w)
+
+            elif op.op_type == 'MaxPool':
+                inp = tensors[op.input[0]]
+                in_shape = tensor_shapes.get(op.input[0], (1, 1, 1, 1))
+                N, C, H, W_dim = in_shape
+
+                kernel_shape = [2, 2]
+                strides_p = [2, 2]
+                for attr in op.attribute:
+                    if attr.name == 'kernel_shape':
+                        kernel_shape = list(attr.ints)
+                    elif attr.name == 'strides':
+                        strides_p = list(attr.ints)
+
+                kh, kw = kernel_shape
+                sh, sw = strides_p
+                out_h = (H - kh) // sh + 1
+                out_w = (W_dim - kw) // sw + 1
+                inp_nd = inp.reshape(N, C, H, W_dim).astype(np.int8)
+
+                result = np.full((N, C, out_h, out_w), -128, dtype=np.int8)
+                for n in range(N):
+                    for c in range(C):
+                        for oh in range(out_h):
+                            for ow in range(out_w):
+                                max_val = np.int8(-128)
+                                for ph in range(kh):
+                                    for pw in range(kw):
+                                        v = inp_nd[n, c, oh*sh+ph, ow*sw+pw]
+                                        if v > max_val:
+                                            max_val = v
+                                result[n, c, oh, ow] = max_val
+
+                tensors[op.output[0]] = result.flatten().astype(np.int8)
+                tensor_shapes[op.output[0]] = (N, C, out_h, out_w)
+
+            elif op.op_type == 'Pad':
+                inp = tensors[op.input[0]]
+                in_shape = tensor_shapes.get(op.input[0], (inp.size,))
+                inp_nd = inp.reshape(in_shape)
+
+                pads = [0] * (2 * len(in_shape))
+                if len(op.input) > 1 and op.input[1] in self.initializers:
+                    pads = self.initializers[op.input[1]].flatten().astype(int).tolist()
+
+                pad_widths = []
+                ndim = len(in_shape)
+                for i in range(ndim):
+                    pad_widths.append((pads[i], pads[ndim + i]))
+
+                result = np.pad(inp_nd, pad_widths, mode='constant', constant_values=0)
+                tensors[op.output[0]] = result.flatten().astype(np.int8)
+                tensor_shapes[op.output[0]] = tuple(result.shape)
+
+            elif op.op_type == 'Resize':
+                inp = tensors[op.input[0]]
+                in_shape = tensor_shapes.get(op.input[0], (1, 1, 1, 1))
+                N, C, H, W_dim = in_shape
+                inp_nd = inp.reshape(N, C, H, W_dim)
+
+                out_H, out_W = H * 2, W_dim * 2
+                if len(op.input) > 3 and op.input[3] in self.initializers:
+                    sizes = self.initializers[op.input[3]].flatten().astype(int).tolist()
+                    if len(sizes) == 4:
+                        out_H, out_W = sizes[2], sizes[3]
+                elif len(op.input) > 2 and op.input[2] in self.initializers:
+                    scales = self.initializers[op.input[2]].flatten().astype(float).tolist()
+                    if len(scales) == 4:
+                        out_H = int(H * scales[2])
+                        out_W = int(W_dim * scales[3])
+
+                result = np.zeros((N, C, out_H, out_W), dtype=np.int8)
+                for n in range(N):
+                    for c in range(C):
+                        for oh in range(out_H):
+                            for ow in range(out_W):
+                                src_h = (oh * H) // out_H
+                                src_w = (ow * W_dim) // out_W
+                                result[n, c, oh, ow] = inp_nd[n, c, src_h, src_w]
+
+                tensors[op.output[0]] = result.flatten().astype(np.int8)
+                tensor_shapes[op.output[0]] = (N, C, out_H, out_W)
+
+            elif op.op_type == 'Clip':
+                inp = tensors[op.input[0]]
+                clip_min = -128
+                clip_max = 127
+                if len(op.input) > 1 and op.input[1] in self.initializers:
+                    clip_min = int(self.initializers[op.input[1]].flat[0])
+                if len(op.input) > 2 and op.input[2] in self.initializers:
+                    clip_max = int(self.initializers[op.input[2]].flat[0])
+                result = np.clip(inp.astype(np.int8), clip_min, clip_max).astype(np.int8)
+                tensors[op.output[0]] = result.flatten()
+                tensor_shapes[op.output[0]] = tensor_shapes.get(op.input[0], (inp.size,))
 
         output_name = self.graph.output[0].name
         return tensors.get(output_name, np.array([], dtype=np.int8))
